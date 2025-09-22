@@ -1,10 +1,12 @@
 from fastapi import FastAPI, WebSocket
+import os
 import psycopg2
 
 app = FastAPI()
 
 # ⚠️ Pega aquí tu cadena completa de conexión de Render
-DB_URL = "postgresql://user_1:EcA3Rbtd1gZpWUIDWrhIs6kQk168VGx2@dpg-d37dti0gjchc73c73dqg-a.frankfurt-postgres.render.com/prueba_1_hw7r"
+# DB_URL = "postgresql://user_1:EcA3Rbtd1gZpWUIDWrhIs6kQk168VGx2@dpg-d37dti0gjchc73c73dqg-a.frankfurt-postgres.render.com/prueba_1_hw7r"
+DB_URL = os.getenv("DATABASE_URL")
 
 # Conexión a la base de datos
 conn = psycopg2.connect(DB_URL)
