@@ -1,12 +1,14 @@
-from fastapi import FastAPI, WebSocket
-from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
 import os
 import psycopg2
+import numpy as np
+from fastapi import FastAPI, WebSocket
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
 
-# 🔹 Configuración de CORS
+# =====================
+# Configuración CORS
+# =====================
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -19,59 +21,70 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# DB_URL desde variables de entorno en Render
+# =====================
+# Conexión a PostgreSQL
+# =====================
 DB_URL = os.getenv("DATABASE_URL")
 
-# Conexión a la base de datos
 conn = psycopg2.connect(DB_URL)
 cursor = conn.cursor()
 
+# =====================
+# Rutas API
+# =====================
 @app.get("/")
-def home():
-    return {"message": "Servidor FastAPI funcionando ✅"}
+async def root():
+    return {"message": "Servidor funcionando ✅"}
 
-# 🔹 Endpoint REST para consultar últimos registros
 @app.get("/signals")
-def get_signals(limit: int = 20):
-    """
-    Devuelve los últimos 'limit' registros de la tabla brain_signals,
-    mostrando directamente el valor en µV.
-    """
+async def get_signals():
     cursor.execute(
-        """
-        SELECT id, timestamp, device_id, value_uv
-        FROM brain_signals
-        ORDER BY id DESC
-        LIMIT %s
-        """,
-        (limit,)
+        "SELECT id, timestamp, device_id, value_uv FROM brain_signals ORDER BY id DESC LIMIT 50;"
     )
     rows = cursor.fetchall()
-    results = [
-        {"id": r[0], "timestamp": r[1].isoformat(), "device_id": r[2], "value_uv": r[3]}
+    return [
+        {
+            "id": r[0],
+            "timestamp": r[1],
+            "device_id": r[2],
+            "value_uv": r[3],
+        }
         for r in rows
     ]
-    return JSONResponse(content=results)
 
-# 🔹 WebSocket (para datos entrantes de la app Android)
+# =====================
+# WebSocket
+# =====================
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    print("Cliente conectado")
+    print("📡 Cliente conectado al WebSocket")
 
     try:
         while True:
-            data = await websocket.receive_text()
-            print(f"Paquete recibido: {data}")
+            data_bytes = await websocket.receive_bytes()  # 🔹 recibir binario
+            print(f"📩 Paquete binario recibido: {len(data_bytes)} bytes")
 
-            # Insertar en la DB → ahora ya no se guarda el HEX, sino que
-            # debería ser un valor ya convertido (µV) o JSON con lotes.
-            cursor.execute(
-                "INSERT INTO brain_signals (device_id, data_hex) VALUES (%s, %s)",
-                ("pcb_001", data)
-            )
+            # Convertir a floats (float32, little endian)
+            try:
+                values = np.frombuffer(data_bytes, dtype=np.float32).tolist()
+            except Exception as e:
+                print("❌ Error al decodificar paquete:", e)
+                continue
+
+            # Guardar cada valor en la base de datos
+            for v in values:
+                cursor.execute(
+                    "INSERT INTO brain_signals (device_id, value_uv) VALUES (%s, %s)",
+                    ("pcb_001", v)
+                )
             conn.commit()
 
-            await websocket.send_text("Paquete guardado en DB")
+            print(f"✅ Guardados {len(values)} valores en la DB")
+
+            await websocket.send_text(f"Guardados {len(values)} valores en la DB")
     except Exception as e:
-        print(f"Cliente desconectado: {e}")
+        print("⚠️ Error en WebSocket:", e)
+    finally:
+        await websocket.close()
+        print("❌ Cliente desconectado")
