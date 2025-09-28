@@ -1,8 +1,10 @@
 import os
 import psycopg2
 import numpy as np
-from fastapi import FastAPI, WebSocket
+import asyncio
+from fastapi import FastAPI, WebSocket, Query
 from fastapi.middleware.cors import CORSMiddleware
+from filters import bandpass_filter, notch_filter  # 👈 tus funciones de filtrado
 
 app = FastAPI()
 
@@ -11,11 +13,7 @@ app = FastAPI()
 # =====================
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",          # Frontend local
-        "https://neuronatech.vercel.app", # ⚠️ cambia por la URL real en Vercel
-        "*",  # Para pruebas, puedes quitarlo en producción
-    ],
+    allow_origins=["http://localhost:5173", "https://neuronatech.vercel.app", "*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -25,7 +23,6 @@ app.add_middleware(
 # Conexión a PostgreSQL
 # =====================
 DB_URL = os.getenv("DATABASE_URL")
-
 conn = psycopg2.connect(DB_URL)
 cursor = conn.cursor()
 
@@ -37,18 +34,26 @@ async def root():
     return {"message": "Servidor funcionando ✅"}
 
 @app.get("/signals")
-async def get_signals():
+async def get_signals(limit: int = Query(2500, ge=1, le=10000)):
     cursor.execute(
-        "SELECT id, timestamp, device_id, value_uv FROM brain_signals ORDER BY id DESC LIMIT 2500;"
+        "SELECT id, timestamp, device_id, value_uv FROM brain_signals ORDER BY id DESC LIMIT %s;",
+        (limit,),
     )
     rows = cursor.fetchall()
     return [
-        {
-            "id": r[0],
-            "timestamp": r[1],
-            "device_id": r[2],
-            "value_uv": r[3],
-        }
+        {"id": r[0], "timestamp": r[1], "device_id": r[2], "value_uv": r[3]}
+        for r in rows
+    ]
+
+@app.get("/signals/processed")
+async def get_signals_processed(limit: int = Query(2500, ge=1, le=10000)):
+    cursor.execute(
+        "SELECT id, timestamp, device_id, value_uv FROM brain_signals_processed ORDER BY id DESC LIMIT %s;",
+        (limit,),
+    )
+    rows = cursor.fetchall()
+    return [
+        {"id": r[0], "timestamp": r[1], "device_id": r[2], "value_uv": r[3]}
         for r in rows
     ]
 
@@ -62,29 +67,60 @@ async def websocket_endpoint(websocket: WebSocket):
 
     try:
         while True:
-            data_bytes = await websocket.receive_bytes()  # 🔹 recibir binario
+            data_bytes = await websocket.receive_bytes()
             print(f"📩 Paquete binario recibido: {len(data_bytes)} bytes")
 
-            # Convertir a floats (float32, little endian)
             try:
                 values = np.frombuffer(data_bytes, dtype=np.float32).tolist()
             except Exception as e:
                 print("❌ Error al decodificar paquete:", e)
                 continue
 
-            # Guardar cada valor en la base de datos
             for v in values:
                 cursor.execute(
                     "INSERT INTO brain_signals (device_id, value_uv) VALUES (%s, %s)",
-                    ("pcb_001", v)
+                    ("pcb_001", v),
                 )
             conn.commit()
 
             print(f"✅ Guardados {len(values)} valores en la DB")
-
             await websocket.send_text(f"Guardados {len(values)} valores en la DB")
     except Exception as e:
         print("⚠️ Error en WebSocket:", e)
     finally:
         await websocket.close()
         print("❌ Cliente desconectado")
+
+# =====================
+# Tarea de filtrado en segundo plano
+# =====================
+async def process_loop():
+    while True:
+        try:
+            cursor.execute(
+                "SELECT value_uv FROM brain_signals ORDER BY id DESC LIMIT 2500;"
+            )
+            rows = cursor.fetchall()
+            if rows:
+                raw = np.array([r[0] for r in rows], dtype=np.float32)
+
+                # aplicar filtros
+                filtered = bandpass_filter(raw, fs=250, low=1, high=40)
+                filtered = notch_filter(filtered, fs=250, freq=50)
+
+                # guardar en DB
+                for v in filtered:
+                    cursor.execute(
+                        "INSERT INTO brain_signals_processed (device_id, value_uv) VALUES (%s, %s)",
+                        ("pcb_001", float(v)),
+                    )
+                conn.commit()
+                print(f"✅ Filtrados {len(filtered)} valores y guardados en brain_signals_processed")
+        except Exception as e:
+            print("❌ Error en loop de filtrado:", e)
+
+        await asyncio.sleep(10)  # repetir cada 10s
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(process_loop())
