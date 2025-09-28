@@ -1,37 +1,50 @@
+# filters.py
 import numpy as np
-import mne
+from scipy.signal import butter, filtfilt, iirnotch
 
-# Parámetros de filtrado
-HPF_HZ   = 0.5   # pasa altos
-LPF_HZ   = 70.0  # pasa bajos
-NOTCH_HZ = 50.0  # notch
-SFREQ    = 250   # Hz
+# =========================
+# Bandpass (1–40 Hz)
+# =========================
+def bandpass_filter(data, fs=250, low=1, high=40, order=4):
+    """
+    Aplica un filtro paso banda Butterworth.
+    - fs: frecuencia de muestreo (Hz)
+    - low, high: frecuencias de corte (Hz)
+    - order: orden del filtro
+    """
+    nyq = 0.5 * fs
+    low_cut = low / nyq
+    high_cut = high / nyq
+    b, a = butter(order, [low_cut, high_cut], btype="band")
+    return filtfilt(b, a, data)
 
-def compute_fft(uV_signal, sfreq=SFREQ):
-    """ Calcula FFT de la señal en µV. """
-    x = np.asarray(uV_signal, dtype=float)
-    x = x - np.mean(x)
-    w = np.hanning(len(x))
-    X = np.fft.rfft(x * w)
-    f = np.fft.rfftfreq(len(x), d=1.0/sfreq)
-    mag = (2.0 / np.sum(w)) * np.abs(X)
-    if len(mag) > 0:
-        mag[0] = mag[0] / 2.0
-    return f.tolist(), mag.tolist()
+# =========================
+# Notch (50 Hz)
+# =========================
+def notch_filter(data, fs=250, freq=50, quality=30):
+    """
+    Aplica un notch (filtro elimina banda) en la frecuencia especificada.
+    - fs: frecuencia de muestreo (Hz)
+    - freq: frecuencia central a eliminar (Hz)
+    - quality: factor Q (más alto = notch más estrecho)
+    """
+    nyq = 0.5 * fs
+    w0 = freq / nyq
+    b, a = iirnotch(w0, quality)
+    return filtfilt(b, a, data)
 
-def process_ch1(ch1_uV, sfreq=SFREQ):
-    """ Filtra CH1 y calcula su FFT. """
-    # Notch 50 Hz
-    ch1_nf = mne.filter.notch_filter(
-        ch1_uV, Fs=sfreq, freqs=[NOTCH_HZ], verbose='ERROR'
-    )
-    # Banda 0.5–70 Hz
-    ch1_bp = mne.filter.filter_data(
-        ch1_nf, sfreq, HPF_HZ, LPF_HZ, verbose='ERROR'
-    )
-    # FFT
-    f, mag = compute_fft(ch1_bp, sfreq)
-    return {
-        "ch1_filtered": ch1_bp.tolist(),
-        "fft": {"f": f, "mag": mag},
-    }
+# =========================
+# Pipeline completo
+# =========================
+def preprocess_signal(data, fs=250):
+    """
+    Preprocesa la señal de un único canal (CH1):
+    1. Bandpass 1–40 Hz
+    2. Notch 50 Hz
+    """
+    if len(data) < 10:
+        return data  # evita errores con buffers demasiado pequeños
+
+    filtered = bandpass_filter(data, fs=fs, low=1, high=40, order=4)
+    filtered = notch_filter(filtered, fs=fs, freq=50, quality=30)
+    return filtered
