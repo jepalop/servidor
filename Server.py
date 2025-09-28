@@ -1,7 +1,7 @@
 import os
 import psycopg2
 import numpy as np
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, WebSocket, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
@@ -13,8 +13,8 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173",          # Frontend local
-        "https://neuronatech.vercel.app", # ⚠️ cambia por la URL real en Vercel
-        "*",  # Para pruebas, puedes quitarlo en producción
+        "https://neuronatech.vercel.app", # URL en Vercel
+        "*",  # Para pruebas, quitar en producción
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -37,9 +37,14 @@ async def root():
     return {"message": "Servidor funcionando ✅"}
 
 @app.get("/signals")
-async def get_signals():
+async def get_signals(limit: int = Query(2500, ge=1, le=10000)):
+    """
+    Devuelve los últimos 'limit' registros.
+    Por defecto: 2500 (≈10s a 250 Hz).
+    """
     cursor.execute(
-        "SELECT id, timestamp, device_id, value_uv FROM brain_signals ORDER BY id DESC LIMIT 50;"
+        "SELECT id, timestamp, device_id, value_uv FROM brain_signals ORDER BY id DESC LIMIT %s;",
+        (limit,)
     )
     rows = cursor.fetchall()
     return [
@@ -62,10 +67,9 @@ async def websocket_endpoint(websocket: WebSocket):
 
     try:
         while True:
-            data_bytes = await websocket.receive_bytes()  # 🔹 recibir binario
+            data_bytes = await websocket.receive_bytes()  # recibir binario
             print(f"📩 Paquete binario recibido: {len(data_bytes)} bytes")
 
-            # Convertir a floats (float32, little endian)
             try:
                 values = np.frombuffer(data_bytes, dtype=np.float32).tolist()
             except Exception as e:
