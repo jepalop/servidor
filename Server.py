@@ -7,9 +7,6 @@ from scipy.signal import butter, filtfilt, iirnotch
 
 app = FastAPI()
 
-# =====================
-# Configuración CORS
-# =====================
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -61,8 +58,7 @@ async def root():
 async def get_signals(limit: int = Query(2500, ge=1, le=10000)):
     """Últimos 'limit' valores crudos"""
     cursor.execute(
-        "SELECT id, timestamp, device_id, value_uv FROM brain_signals ORDER BY id DESC LIMIT %s;",
-        (limit,),
+        "SELECT id, timestamp, device_id, value_uv FROM brain_signals ORDER BY id DESC LIMIT 2500;"
     )
     rows = cursor.fetchall()
     return [
@@ -74,8 +70,7 @@ async def get_signals(limit: int = Query(2500, ge=1, le=10000)):
 async def get_signals_processed(limit: int = Query(2500, ge=1, le=10000)):
     """Últimos 'limit' valores filtrados"""
     cursor.execute(
-        "SELECT id, timestamp, device_id, value_uv FROM brain_signals_processed ORDER BY id DESC LIMIT %s;",
-        (limit,),
+        "SELECT id, timestamp, device_id, value_uv FROM brain_signals_processed ORDER BY id DESC LIMIT 2500;"
     )
     rows = cursor.fetchall()
     return [
