@@ -39,7 +39,7 @@ async def root():
 @app.get("/signals")
 async def get_signals():
     cursor.execute(
-        "SELECT id, timestamp, device_id, value_uv FROM brain_signals ORDER BY id DESC LIMIT 50;"
+        "SELECT id, timestamp, device_id, value_uv FROM brain_signals ORDER BY id DESC LIMIT 2500;"
     )
     rows = cursor.fetchall()
     return [
