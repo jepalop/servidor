@@ -7,6 +7,9 @@ from scipy.signal import butter, filtfilt, iirnotch
 
 app = FastAPI()
 
+# =====================
+# Configuración CORS
+# =====================
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -27,7 +30,7 @@ conn = psycopg2.connect(DB_URL)
 cursor = conn.cursor()
 
 # =====================
-# Funciones de filtrado
+# Funciones de filtrado y FFT
 # =====================
 FS = 250  # Hz (ajusta según tu muestreo real)
 
@@ -47,6 +50,14 @@ def apply_filters(values):
     arr = bandpass_filter(arr, 1, 40)      # 1–40 Hz
     return arr.tolist()
 
+def compute_fft(values, fs=FS):
+    arr = np.array(values, dtype=np.float32)
+    n = len(arr)
+    freqs = np.fft.rfftfreq(n, 1/fs)
+    fft_vals = np.abs(np.fft.rfft(arr)) / n
+    # devolvemos como pares frecuencia-amplitud
+    return [{"f": float(f), "a": float(a)} for f, a in zip(freqs, fft_vals)]
+
 # =====================
 # Rutas API
 # =====================
@@ -58,7 +69,8 @@ async def root():
 async def get_signals(limit: int = Query(2500, ge=1, le=10000)):
     """Últimos 'limit' valores crudos"""
     cursor.execute(
-        "SELECT id, timestamp, device_id, value_uv FROM brain_signals ORDER BY id DESC LIMIT 2500;"
+        "SELECT id, timestamp, device_id, value_uv FROM brain_signals ORDER BY id DESC LIMIT 2500;",
+        (limit,),
     )
     rows = cursor.fetchall()
     return [
@@ -70,11 +82,18 @@ async def get_signals(limit: int = Query(2500, ge=1, le=10000)):
 async def get_signals_processed(limit: int = Query(2500, ge=1, le=10000)):
     """Últimos 'limit' valores filtrados"""
     cursor.execute(
-        "SELECT id, timestamp, device_id, value_uv FROM brain_signals_processed ORDER BY id DESC LIMIT 2500;"
+        "SELECT id, timestamp, device_id, value_uv, fft FROM brain_signals_processed ORDER BY id DESC LIMIT 2500;",
+        (limit,),
     )
     rows = cursor.fetchall()
     return [
-        {"id": r[0], "timestamp": r[1], "device_id": r[2], "value_uv": r[3]}
+        {
+            "id": r[0],
+            "timestamp": r[1],
+            "device_id": r[2],
+            "value_uv": r[3],
+            "fft": r[4],
+        }
         for r in rows
     ]
 
@@ -105,20 +124,24 @@ async def websocket_endpoint(websocket: WebSocket):
                 )
             conn.commit()
 
-            # Filtrar y guardar señal procesada
+            # Filtrar y guardar señal procesada + FFT
             try:
                 filtered = apply_filters(values)
+                fft_data = compute_fft(filtered)
+
                 for fv in filtered:
                     cursor.execute(
-                        "INSERT INTO brain_signals_processed (device_id, value_uv) VALUES (%s, %s)",
-                        ("pcb_001", fv),
+                        "INSERT INTO brain_signals_processed (device_id, value_uv, fft) VALUES (%s, %s, %s)",
+                        ("pcb_001", fv, psycopg2.extras.Json(fft_data)),
                     )
                 conn.commit()
-                print(f"✅ Guardados {len(filtered)} valores filtrados")
+                print(f"✅ Guardados {len(filtered)} valores filtrados con FFT")
             except Exception as e:
-                print("⚠️ Error en filtrado:", e)
+                print("⚠️ Error en filtrado/FFT:", e)
 
-            await websocket.send_text(f"Guardados {len(values)} crudos y {len(values)} filtrados")
+            await websocket.send_text(
+                f"Guardados {len(values)} crudos, {len(values)} filtrados y FFT"
+            )
     except Exception as e:
         print("⚠️ Error en WebSocket:", e)
     finally:
