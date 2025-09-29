@@ -14,9 +14,9 @@ app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:5173",          # Frontend local
-        "https://neuronatech.vercel.app", # URL en Vercel
-        "*",  # Para pruebas, quítalo en producción
+        "http://localhost:5173",
+        "https://neuronatech.vercel.app",
+        "*",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -47,8 +47,8 @@ def notch_filter(data, f0=50.0, Q=30.0, fs=FS):
 
 def apply_filters(values):
     arr = np.array(values, dtype=np.float32)
-    arr = notch_filter(arr, f0=50.0)       # quitar 50 Hz
-    arr = bandpass_filter(arr, 1, 40)      # 1–40 Hz
+    arr = notch_filter(arr, f0=50.0)
+    arr = bandpass_filter(arr, 1, 40)
     return arr.tolist()
 
 def compute_fft(values, fs=FS):
@@ -66,7 +66,6 @@ async def root():
 
 @app.get("/signals")
 async def get_signals(limit: int = Query(2500, ge=1, le=10000)):
-    """Últimos 'limit' valores crudos"""
     cursor.execute(
         "SELECT id, timestamp, device_id, value_uv FROM brain_signals ORDER BY id DESC LIMIT %s;",
         (limit,),
@@ -79,7 +78,6 @@ async def get_signals(limit: int = Query(2500, ge=1, le=10000)):
 
 @app.get("/signals/processed")
 async def get_signals_processed(limit: int = Query(2500, ge=1, le=10000)):
-    """Últimos 'limit' valores filtrados"""
     cursor.execute(
         "SELECT id, timestamp, device_id, value_uv, fft FROM brain_signals_processed ORDER BY id DESC LIMIT %s;",
         (limit,),
@@ -115,29 +113,29 @@ async def websocket_endpoint(websocket: WebSocket):
                     "INSERT INTO brain_signals (device_id, value_uv) VALUES (%s, %s)",
                     ("pcb_001", v),
                 )
-            conn.commit()
 
             # Filtrar y calcular FFT
             try:
                 filtered = apply_filters(values)
                 fft_data = compute_fft(filtered)
 
-                # Guardar señal filtrada (valor a valor)
+                # Guardar señal filtrada
                 for fv in filtered:
                     cursor.execute(
                         "INSERT INTO brain_signals_processed (device_id, value_uv) VALUES (%s, %s)",
                         ("pcb_001", fv),
                     )
 
-                # Guardar FFT en la primera fila de este bloque
+                # Guardar FFT en una fila separada
                 cursor.execute(
-                    "INSERT INTO brain_signals_processed (device_id, value_uv, fft) VALUES (%s, %s, %s)",
-                    ("pcb_001", None, Json(fft_data)),
+                    "INSERT INTO brain_signals_processed (device_id, fft) VALUES (%s, %s)",
+                    ("pcb_001", Json(fft_data)),
                 )
 
                 conn.commit()
                 print(f"✅ Guardados {len(filtered)} valores filtrados + FFT")
             except Exception as e:
+                conn.rollback()
                 print("⚠️ Error en filtrado/FFT:", e)
 
             await websocket.send_text(
