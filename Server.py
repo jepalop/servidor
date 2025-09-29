@@ -1,5 +1,6 @@
 import os
 import psycopg2
+import psycopg2.extras
 import numpy as np
 from fastapi import FastAPI, WebSocket, Query
 from fastapi.middleware.cors import CORSMiddleware
