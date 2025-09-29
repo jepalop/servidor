@@ -79,12 +79,24 @@ async def get_signals(limit: int = Query(2500, ge=1, le=10000)):
 @app.get("/signals/processed")
 async def get_signals_processed(limit: int = Query(2500, ge=1, le=10000)):
     cursor.execute(
-        "SELECT id, timestamp, device_id, value_uv, fft FROM brain_signals_processed ORDER BY id DESC LIMIT %s;",
+        "SELECT id, timestamp, device_id, value_uv FROM brain_signals_processed ORDER BY id DESC LIMIT %s;",
         (limit,),
     )
     rows = cursor.fetchall()
     return [
-        {"id": r[0], "timestamp": r[1], "device_id": r[2], "value_uv": r[3], "fft": r[4]}
+        {"id": r[0], "timestamp": r[1], "device_id": r[2], "value_uv": r[3]}
+        for r in rows
+    ]
+
+@app.get("/signals/fft")
+async def get_signals_fft(limit: int = Query(10, ge=1, le=100)):
+    cursor.execute(
+        "SELECT id, timestamp, device_id, fft FROM brain_signals_fft ORDER BY id DESC LIMIT %s;",
+        (limit,),
+    )
+    rows = cursor.fetchall()
+    return [
+        {"id": r[0], "timestamp": r[1], "device_id": r[2], "fft": r[3]}
         for r in rows
     ]
 
@@ -126,14 +138,14 @@ async def websocket_endpoint(websocket: WebSocket):
                         ("pcb_001", fv),
                     )
 
-                # Guardar FFT en una fila separada
+                # Guardar FFT en tabla separada
                 cursor.execute(
-                    "INSERT INTO brain_signals_processed (device_id, fft) VALUES (%s, %s)",
+                    "INSERT INTO brain_signals_fft (device_id, fft) VALUES (%s, %s)",
                     ("pcb_001", Json(fft_data)),
                 )
 
                 conn.commit()
-                print(f"✅ Guardados {len(filtered)} valores filtrados + FFT")
+                print(f"✅ Guardados {len(values)} crudos, {len(filtered)} filtrados y FFT")
             except Exception as e:
                 conn.rollback()
                 print("⚠️ Error en filtrado/FFT:", e)
