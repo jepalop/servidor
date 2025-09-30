@@ -1,6 +1,5 @@
 import os
 import psycopg2
-import json
 import numpy as np
 from fastapi import FastAPI, WebSocket, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -51,12 +50,6 @@ def apply_filters(values):
     arr = bandpass_filter(arr, 1, 40)
     return arr.tolist()
 
-def compute_fft(values, fs=FS):
-    arr = np.array(values, dtype=np.float32)
-    freqs = np.fft.rfftfreq(len(arr), d=1 / fs)
-    fft_vals = np.abs(np.fft.rfft(arr))
-    return {"freqs": freqs.tolist(), "fft": fft_vals.tolist()}
-
 # =====================
 # Rutas API
 # =====================
@@ -88,18 +81,6 @@ async def get_signals_processed(limit: int = Query(2500, ge=1, le=10000)):
         for r in rows
     ]
 
-@app.get("/signals/fft")
-async def get_signals_fft(limit: int = Query(10, ge=1, le=100)):  # devuelvo menos porque son JSON grandes
-    cursor.execute(
-        "SELECT id, timestamp, device_id, fft FROM brain_signals_fft ORDER BY id DESC LIMIT %s;",
-        (limit,),
-    )
-    rows = cursor.fetchall()
-    return [
-        {"id": r[0], "timestamp": r[1], "device_id": r[2], "fft": r[3]}
-        for r in rows
-    ]
-
 # =====================
 # WebSocket
 # =====================
@@ -126,10 +107,9 @@ async def websocket_endpoint(websocket: WebSocket):
                     ("pcb_001", v),
                 )
 
-            # Filtrar y calcular FFT
+            # Filtrar
             try:
                 filtered = apply_filters(values)
-                fft_data = compute_fft(filtered)
 
                 # Guardar señal filtrada
                 for fv in filtered:
@@ -138,20 +118,14 @@ async def websocket_endpoint(websocket: WebSocket):
                         ("pcb_001", fv),
                     )
 
-                # Guardar FFT en tabla separada (serializado con json.dumps)
-                cursor.execute(
-                    "INSERT INTO brain_signals_fft (device_id, fft) VALUES (%s, %s)",
-                    ("pcb_001", json.dumps(fft_data)),
-                )
-
                 conn.commit()
-                print(f"✅ Guardados {len(values)} crudos, {len(filtered)} filtrados y FFT")
+                print(f"✅ Guardados {len(values)} crudos y {len(filtered)} filtrados")
             except Exception as e:
                 conn.rollback()
-                print("⚠️ Error en filtrado/FFT:", e)
+                print("⚠️ Error en filtrado:", e)
 
             await websocket.send_text(
-                f"Guardados {len(values)} crudos, {len(values)} filtrados y FFT"
+                f"Guardados {len(values)} crudos y {len(values)} filtrados"
             )
     except Exception as e:
         print("⚠️ Error en WebSocket:", e)
