@@ -1,6 +1,7 @@
 import os
 import psycopg2
 import numpy as np
+from datetime import datetime
 from fastapi import FastAPI, WebSocket, Query
 from fastapi.middleware.cors import CORSMiddleware
 from scipy.signal import butter, filtfilt, iirnotch
@@ -58,7 +59,7 @@ async def root():
     return {"message": "Servidor funcionando ✅"}
 
 @app.get("/signals")
-async def get_signals(limit: int = Query(2500, ge=1, le=10000)):
+async def get_signals(limit: int = Query(750, ge=1, le=10000)):  # 🔹 ahora 750 por defecto
     cursor.execute(
         "SELECT id, timestamp, device_id, value_uv FROM brain_signals ORDER BY id DESC LIMIT %s;",
         (limit,),
@@ -70,7 +71,7 @@ async def get_signals(limit: int = Query(2500, ge=1, le=10000)):
     ]
 
 @app.get("/signals/processed")
-async def get_signals_processed(limit: int = Query(2500, ge=1, le=10000)):
+async def get_signals_processed(limit: int = Query(750, ge=1, le=10000)):  # 🔹 ahora 750 por defecto
     cursor.execute(
         "SELECT id, timestamp, device_id, value_uv FROM brain_signals_processed ORDER BY id DESC LIMIT %s;",
         (limit,),
@@ -92,7 +93,7 @@ async def websocket_endpoint(websocket: WebSocket):
     try:
         while True:
             data_bytes = await websocket.receive_bytes()
-            print(f"📩 Paquete binario recibido: {len(data_bytes)} bytes")
+            print(f"📩 {datetime.now()} - Paquete recibido: {len(data_bytes)} bytes")
 
             try:
                 values = np.frombuffer(data_bytes, dtype=np.float32).tolist()
@@ -107,11 +108,10 @@ async def websocket_endpoint(websocket: WebSocket):
                     ("pcb_001", v),
                 )
 
-            # Filtrar
+            # Filtrar y guardar
             try:
                 filtered = apply_filters(values)
 
-                # Guardar señal filtrada
                 for fv in filtered:
                     cursor.execute(
                         "INSERT INTO brain_signals_processed (device_id, value_uv) VALUES (%s, %s)",
@@ -119,7 +119,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     )
 
                 conn.commit()
-                print(f"✅ Guardados {len(values)} crudos y {len(filtered)} filtrados")
+                print(f"✅ {datetime.now()} - Guardados {len(values)} crudos y {len(filtered)} filtrados")
             except Exception as e:
                 conn.rollback()
                 print("⚠️ Error en filtrado:", e)
