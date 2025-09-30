@@ -89,7 +89,7 @@ async def get_signals_processed(limit: int = Query(2500, ge=1, le=10000)):
     ]
 
 @app.get("/signals/fft")
-async def get_signals_fft(limit: int = Query(10, ge=1, le=100)):
+async def get_signals_fft(limit: int = Query(2500, ge=1, le=10000)):
     cursor.execute(
         "SELECT id, timestamp, device_id, fft FROM brain_signals_fft ORDER BY id DESC LIMIT %s;",
         (limit,),
