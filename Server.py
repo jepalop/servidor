@@ -1,6 +1,6 @@
 import os
 import psycopg2
-from psycopg2.extras import Json
+import json
 import numpy as np
 from fastapi import FastAPI, WebSocket, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -37,12 +37,12 @@ FS = 250  # Hz
 
 def bandpass_filter(data, low=1, high=40, fs=FS, order=4):
     nyq = 0.5 * fs
-    b, a = butter(order, [low/nyq, high/nyq], btype="band")
+    b, a = butter(order, [low / nyq, high / nyq], btype="band")
     return filtfilt(b, a, data)
 
 def notch_filter(data, f0=50.0, Q=30.0, fs=FS):
     nyq = 0.5 * fs
-    b, a = iirnotch(f0/nyq, Q)
+    b, a = iirnotch(f0 / nyq, Q)
     return filtfilt(b, a, data)
 
 def apply_filters(values):
@@ -53,7 +53,7 @@ def apply_filters(values):
 
 def compute_fft(values, fs=FS):
     arr = np.array(values, dtype=np.float32)
-    freqs = np.fft.rfftfreq(len(arr), d=1/fs)
+    freqs = np.fft.rfftfreq(len(arr), d=1 / fs)
     fft_vals = np.abs(np.fft.rfft(arr))
     return {"freqs": freqs.tolist(), "fft": fft_vals.tolist()}
 
@@ -89,7 +89,7 @@ async def get_signals_processed(limit: int = Query(2500, ge=1, le=10000)):
     ]
 
 @app.get("/signals/fft")
-async def get_signals_fft(limit: int = Query(2500, ge=1, le=10000)):
+async def get_signals_fft(limit: int = Query(10, ge=1, le=100)):  # devuelvo menos porque son JSON grandes
     cursor.execute(
         "SELECT id, timestamp, device_id, fft FROM brain_signals_fft ORDER BY id DESC LIMIT %s;",
         (limit,),
@@ -138,10 +138,10 @@ async def websocket_endpoint(websocket: WebSocket):
                         ("pcb_001", fv),
                     )
 
-                # Guardar FFT en tabla separada
+                # Guardar FFT en tabla separada (serializado con json.dumps)
                 cursor.execute(
                     "INSERT INTO brain_signals_fft (device_id, fft) VALUES (%s, %s)",
-                    ("pcb_001", Json(fft_data)),
+                    ("pcb_001", json.dumps(fft_data)),
                 )
 
                 conn.commit()
