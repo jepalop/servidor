@@ -52,33 +52,33 @@ def apply_filters(values):
     return arr.tolist()
 
 # =====================
-# Rutas API
+# Rutas API REST
 # =====================
 @app.get("/")
 async def root():
     return {"message": "Servidor funcionando ✅"}
 
 @app.get("/signals")
-async def get_signals(limit: int = Query(750, ge=1, le=10000)):  # 🔹 ahora 750 por defecto
+async def get_signals(limit: int = Query(750, ge=1, le=10000)):
     cursor.execute(
         "SELECT id, timestamp, device_id, value_uv FROM brain_signals ORDER BY id DESC LIMIT %s;",
         (limit,),
     )
     rows = cursor.fetchall()
     return [
-        {"id": r[0], "timestamp": r[1], "device_id": r[2], "value_uv": r[3]}
+        {"id": r[0], "timestamp": r[1], "device_id": r[2], "value_uv": float(r[3])}
         for r in rows
     ]
 
 @app.get("/signals/processed")
-async def get_signals_processed(limit: int = Query(750, ge=1, le=10000)):  # 🔹 ahora 750 por defecto
+async def get_signals_processed(limit: int = Query(750, ge=1, le=10000)):
     cursor.execute(
         "SELECT id, timestamp, device_id, value_uv FROM brain_signals_processed ORDER BY id DESC LIMIT %s;",
         (limit,),
     )
     rows = cursor.fetchall()
     return [
-        {"id": r[0], "timestamp": r[1], "device_id": r[2], "value_uv": r[3]}
+        {"id": r[0], "timestamp": r[1], "device_id": r[2], "value_uv": float(r[3])}
         for r in rows
     ]
 
@@ -92,26 +92,27 @@ async def websocket_endpoint(websocket: WebSocket):
 
     try:
         while True:
+            # Recibir paquete binario
             data_bytes = await websocket.receive_bytes()
             print(f"📩 {datetime.now()} - Paquete recibido: {len(data_bytes)} bytes")
 
             try:
-                values = np.frombuffer(data_bytes, dtype=np.float32).tolist()
+                # Decodificar como float32 little-endian
+                values = np.frombuffer(data_bytes, dtype="<f4").astype(float).tolist()
             except Exception as e:
                 print("❌ Error al decodificar paquete:", e)
                 continue
 
-            # Guardar señal cruda
-            for v in values:
-                cursor.execute(
-                    "INSERT INTO brain_signals (device_id, value_uv) VALUES (%s, %s)",
-                    ("pcb_001", v),
-                )
-
-            # Filtrar y guardar
             try:
-                filtered = apply_filters(values)
+                # Guardar señal cruda
+                for v in values:
+                    cursor.execute(
+                        "INSERT INTO brain_signals (device_id, value_uv) VALUES (%s, %s)",
+                        ("pcb_001", v),
+                    )
 
+                # Filtrar y guardar
+                filtered = apply_filters(values)
                 for fv in filtered:
                     cursor.execute(
                         "INSERT INTO brain_signals_processed (device_id, value_uv) VALUES (%s, %s)",
@@ -122,11 +123,13 @@ async def websocket_endpoint(websocket: WebSocket):
                 print(f"✅ {datetime.now()} - Guardados {len(values)} crudos y {len(filtered)} filtrados")
             except Exception as e:
                 conn.rollback()
-                print("⚠️ Error en filtrado:", e)
+                print("⚠️ Error al insertar en DB:", e)
 
+            # Confirmar al cliente
             await websocket.send_text(
                 f"Guardados {len(values)} crudos y {len(values)} filtrados"
             )
+
     except Exception as e:
         print("⚠️ Error en WebSocket:", e)
     finally:
