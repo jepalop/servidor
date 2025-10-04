@@ -5,6 +5,7 @@ from datetime import datetime
 from fastapi import FastAPI, WebSocket, Query
 from fastapi.middleware.cors import CORSMiddleware
 from scipy.signal import butter, filtfilt, iirnotch
+import asyncio
 
 app = FastAPI()
 
@@ -83,16 +84,18 @@ async def get_signals_processed(limit: int = Query(750, ge=1, le=10000)):
     ]
 
 # =====================
-# WebSocket
+# WebSockets
 # =====================
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
+clients = set()  # 🔹 clientes frontend suscritos
+
+@app.websocket("/ws")  # PCB -> servidor
+async def websocket_pcb(websocket: WebSocket):
     await websocket.accept()
-    print("📡 Cliente conectado al WebSocket")
+    print("📡 PCB conectado al WebSocket")
 
     try:
         while True:
-            # Recibir paquete binario
+            # Recibir paquete binario desde la PCB
             data_bytes = await websocket.receive_bytes()
             print(f"📩 {datetime.now()} - Paquete recibido: {len(data_bytes)} bytes")
 
@@ -125,13 +128,41 @@ async def websocket_endpoint(websocket: WebSocket):
                 conn.rollback()
                 print("⚠️ Error al insertar en DB:", e)
 
-            # Confirmar al cliente
+            # Confirmar a la PCB
             await websocket.send_text(
                 f"Guardados {len(values)} crudos y {len(values)} filtrados"
             )
 
+            # 🔹 Reenviar a todos los clientes conectados al frontend
+            dead_clients = []
+            for client in clients:
+                try:
+                    await client.send_bytes(data_bytes)
+                except:
+                    dead_clients.append(client)
+
+            # limpiar clientes desconectados
+            for dc in dead_clients:
+                clients.remove(dc)
+
     except Exception as e:
-        print("⚠️ Error en WebSocket:", e)
+        print("⚠️ Error en WebSocket PCB:", e)
     finally:
-        # 🔹 Quitado await websocket.close() para evitar error de doble cierre
-        print("❌ Cliente desconectado")
+        print("❌ PCB desconectado")
+
+@app.websocket("/ws/client")  # frontend -> servidor
+async def websocket_client(websocket: WebSocket):
+    await websocket.accept()
+    clients.add(websocket)
+    print("👀 Cliente conectado al WebSocket")
+
+    try:
+        while True:
+            # Mantener la conexión abierta
+            await asyncio.sleep(1)
+    except Exception as e:
+        print("⚠️ Error en WebSocket cliente:", e)
+    finally:
+        if websocket in clients:
+            clients.remove(websocket)
+        print("👋 Cliente desconectado")
