@@ -133,5 +133,5 @@ async def websocket_endpoint(websocket: WebSocket):
     except Exception as e:
         print("⚠️ Error en WebSocket:", e)
     finally:
-        await websocket.close()
+        # 🔹 Quitado await websocket.close() para evitar error de doble cierre
         print("❌ Cliente desconectado")
