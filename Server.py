@@ -29,7 +29,7 @@ app.add_middleware(
 DB_URL = os.getenv("DATABASE_URL")
 
 def connect_db():
-    """Abre una nueva conexión y cursor a la base de datos"""
+    """Abre nueva conexión y cursor"""
     conn = psycopg2.connect(DB_URL)
     conn.autocommit = False
     return conn, conn.cursor()
@@ -37,7 +37,7 @@ def connect_db():
 conn, cursor = connect_db()
 
 def get_cursor():
-    """Verifica que la conexión siga viva; si no, la reabre"""
+    """Verifica que la conexión siga viva"""
     global conn, cursor
     try:
         cursor.execute("SELECT 1;")
@@ -47,11 +47,11 @@ def get_cursor():
     return cursor
 
 # =====================
-# Parámetros señal
+# Parámetros de señal
 # =====================
 FS = 250  # Hz
 
-def bandpass_filter(data, low=1, high=40, fs=FS, order=4):
+def bandpass_filter(data, low=1, high=40, fs=FS, order=2):  # 🔹 más liviano
     nyq = 0.5 * fs
     b, a = butter(order, [low / nyq, high / nyq], btype="band")
     return filtfilt(b, a, data)
@@ -68,24 +68,11 @@ def apply_filters(values):
     return arr.tolist()
 
 # =====================
-# Rutas API REST
+# API REST
 # =====================
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
     return {"message": "Servidor funcionando ✅"}
-
-@app.get("/signals")
-async def get_signals(limit: int = Query(750, ge=1, le=10000)):
-    c = get_cursor()
-    c.execute(
-        "SELECT id, timestamp, device_id, value_uv FROM brain_signals ORDER BY id DESC LIMIT %s;",
-        (limit,),
-    )
-    rows = c.fetchall()
-    return [
-        {"id": r[0], "timestamp": r[1], "device_id": r[2], "value_uv": float(r[3])}
-        for r in rows
-    ]
 
 @app.get("/signals/processed")
 async def get_signals_processed(limit: int = Query(750, ge=1, le=10000)):
@@ -103,9 +90,9 @@ async def get_signals_processed(limit: int = Query(750, ge=1, le=10000)):
 # =====================
 # WebSockets
 # =====================
-clients = set()  # 🔹 clientes frontend suscritos
+clients = set()
 
-@app.websocket("/ws")  # PCB -> servidor
+@app.websocket("/ws")  # PCB → Servidor
 async def websocket_pcb(websocket: WebSocket):
     await websocket.accept()
     print("📡 PCB conectado al WebSocket")
@@ -123,22 +110,16 @@ async def websocket_pcb(websocket: WebSocket):
 
             try:
                 c = get_cursor()
-
-                # Batch insert crudos
-                c.executemany(
-                    "INSERT INTO brain_signals (device_id, value_uv) VALUES (%s, %s)",
-                    [("pcb_001", v) for v in values],
-                )
-
-                # Filtrar y guardar
                 filtered = apply_filters(values)
+
+                # 🔹 Solo guardar señal filtrada
                 c.executemany(
                     "INSERT INTO brain_signals_processed (device_id, value_uv) VALUES (%s, %s)",
                     [("pcb_001", fv) for fv in filtered],
                 )
 
                 conn.commit()
-                print(f"✅ {datetime.now()} - Guardados {len(values)} crudos y {len(filtered)} filtrados")
+                print(f"✅ {datetime.now()} - Guardados {len(filtered)} datos filtrados")
 
             except Exception as e:
                 conn.rollback()
@@ -146,9 +127,7 @@ async def websocket_pcb(websocket: WebSocket):
                 print("⚠️ Error al insertar en DB:", e)
 
             # Confirmar a la PCB
-            await websocket.send_text(
-                f"Guardados {len(values)} crudos y {len(values)} filtrados"
-            )
+            await websocket.send_text(f"Guardados {len(values)} filtrados")
 
             # 🔹 Reenviar a todos los clientes conectados (filtrados)
             filtered_bytes = np.array(filtered, dtype="<f4").tobytes()
@@ -156,9 +135,8 @@ async def websocket_pcb(websocket: WebSocket):
             for client in clients:
                 try:
                     await client.send_bytes(filtered_bytes)
-                except Exception:
+                except:
                     dead_clients.append(client)
-
             for dc in dead_clients:
                 clients.remove(dc)
 
@@ -167,8 +145,7 @@ async def websocket_pcb(websocket: WebSocket):
     finally:
         print("❌ PCB desconectado")
 
-
-@app.websocket("/ws/client")  # frontend -> servidor
+@app.websocket("/ws/client")
 async def websocket_client(websocket: WebSocket):
     await websocket.accept()
     clients.add(websocket)
@@ -176,7 +153,7 @@ async def websocket_client(websocket: WebSocket):
 
     try:
         while True:
-            # 🔹 Enviar keep-alive cada 15 s
+            # 🔹 Mantiene viva la conexión
             await websocket.send_text("ping")
             await asyncio.sleep(15)
     except Exception as e:
