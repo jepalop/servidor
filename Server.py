@@ -27,8 +27,24 @@ app.add_middleware(
 # Conexión a PostgreSQL
 # =====================
 DB_URL = os.getenv("DATABASE_URL")
-conn = psycopg2.connect(DB_URL)
-cursor = conn.cursor()
+
+def connect_db():
+    """Abre una nueva conexión y cursor a la base de datos"""
+    conn = psycopg2.connect(DB_URL)
+    conn.autocommit = False
+    return conn, conn.cursor()
+
+conn, cursor = connect_db()
+
+def get_cursor():
+    """Verifica que la conexión siga viva; si no, la reabre"""
+    global conn, cursor
+    try:
+        cursor.execute("SELECT 1;")
+    except (Exception, psycopg2.Error):
+        print("🔄 Reabriendo conexión a PostgreSQL...")
+        conn, cursor = connect_db()
+    return cursor
 
 # =====================
 # Parámetros señal
@@ -54,17 +70,18 @@ def apply_filters(values):
 # =====================
 # Rutas API REST
 # =====================
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 async def root():
     return {"message": "Servidor funcionando ✅"}
 
 @app.get("/signals")
 async def get_signals(limit: int = Query(750, ge=1, le=10000)):
-    cursor.execute(
+    c = get_cursor()
+    c.execute(
         "SELECT id, timestamp, device_id, value_uv FROM brain_signals ORDER BY id DESC LIMIT %s;",
         (limit,),
     )
-    rows = cursor.fetchall()
+    rows = c.fetchall()
     return [
         {"id": r[0], "timestamp": r[1], "device_id": r[2], "value_uv": float(r[3])}
         for r in rows
@@ -72,11 +89,12 @@ async def get_signals(limit: int = Query(750, ge=1, le=10000)):
 
 @app.get("/signals/processed")
 async def get_signals_processed(limit: int = Query(750, ge=1, le=10000)):
-    cursor.execute(
+    c = get_cursor()
+    c.execute(
         "SELECT id, timestamp, device_id, value_uv FROM brain_signals_processed ORDER BY id DESC LIMIT %s;",
         (limit,),
     )
-    rows = cursor.fetchall()
+    rows = c.fetchall()
     return [
         {"id": r[0], "timestamp": r[1], "device_id": r[2], "value_uv": float(r[3])}
         for r in rows
@@ -94,37 +112,37 @@ async def websocket_pcb(websocket: WebSocket):
 
     try:
         while True:
-            # Recibir paquete binario desde la PCB
             data_bytes = await websocket.receive_bytes()
             print(f"📩 {datetime.now()} - Paquete recibido: {len(data_bytes)} bytes")
 
             try:
-                # Decodificar como float32 little-endian
                 values = np.frombuffer(data_bytes, dtype="<f4").astype(float).tolist()
             except Exception as e:
                 print("❌ Error al decodificar paquete:", e)
                 continue
 
             try:
-                # Guardar señal cruda
-                for v in values:
-                    cursor.execute(
-                        "INSERT INTO brain_signals (device_id, value_uv) VALUES (%s, %s)",
-                        ("pcb_001", v),
-                    )
+                c = get_cursor()
+
+                # Batch insert crudos
+                c.executemany(
+                    "INSERT INTO brain_signals (device_id, value_uv) VALUES (%s, %s)",
+                    [("pcb_001", v) for v in values],
+                )
 
                 # Filtrar y guardar
                 filtered = apply_filters(values)
-                for fv in filtered:
-                    cursor.execute(
-                        "INSERT INTO brain_signals_processed (device_id, value_uv) VALUES (%s, %s)",
-                        ("pcb_001", fv),
-                    )
+                c.executemany(
+                    "INSERT INTO brain_signals_processed (device_id, value_uv) VALUES (%s, %s)",
+                    [("pcb_001", fv) for fv in filtered],
+                )
 
                 conn.commit()
                 print(f"✅ {datetime.now()} - Guardados {len(values)} crudos y {len(filtered)} filtrados")
+
             except Exception as e:
                 conn.rollback()
+                cursor = conn.cursor()
                 print("⚠️ Error al insertar en DB:", e)
 
             # Confirmar a la PCB
@@ -132,15 +150,15 @@ async def websocket_pcb(websocket: WebSocket):
                 f"Guardados {len(values)} crudos y {len(values)} filtrados"
             )
 
-            # 🔹 Reenviar a todos los clientes conectados al frontend
+            # 🔹 Reenviar a todos los clientes conectados (filtrados)
+            filtered_bytes = np.array(filtered, dtype="<f4").tobytes()
             dead_clients = []
             for client in clients:
                 try:
-                    await client.send_bytes(data_bytes)
-                except:
+                    await client.send_bytes(filtered_bytes)
+                except Exception:
                     dead_clients.append(client)
 
-            # limpiar clientes desconectados
             for dc in dead_clients:
                 clients.remove(dc)
 
@@ -148,6 +166,7 @@ async def websocket_pcb(websocket: WebSocket):
         print("⚠️ Error en WebSocket PCB:", e)
     finally:
         print("❌ PCB desconectado")
+
 
 @app.websocket("/ws/client")  # frontend -> servidor
 async def websocket_client(websocket: WebSocket):
@@ -157,8 +176,9 @@ async def websocket_client(websocket: WebSocket):
 
     try:
         while True:
-            # Mantener la conexión abierta
-            await asyncio.sleep(1)
+            # 🔹 Enviar keep-alive cada 15 s
+            await websocket.send_text("ping")
+            await asyncio.sleep(15)
     except Exception as e:
         print("⚠️ Error en WebSocket cliente:", e)
     finally:
