@@ -31,7 +31,7 @@ cursor = conn.cursor()
 # PARÁMETROS DE PROCESAMIENTO DE SEÑAL
 # ============================================================
 FS = 250           # Hz
-HPF_HZ = 4
+HPF_HZ = 0.5
 LPF_HZ = 70.0
 NOTCH_HZ = 50.0
 
