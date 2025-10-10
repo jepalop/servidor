@@ -4,7 +4,6 @@ import numpy as np
 from datetime import datetime
 from fastapi import FastAPI, WebSocket, Query
 from fastapi.middleware.cors import CORSMiddleware
-from scipy.signal import butter, filtfilt, iirnotch
 import asyncio
 
 # ============================================================
@@ -28,55 +27,17 @@ conn = psycopg2.connect(DB_URL)
 cursor = conn.cursor()
 
 # ============================================================
-# PARÁMETROS DE PROCESAMIENTO DE SEÑAL
+# PARÁMETROS BÁSICOS
 # ============================================================
-FS = 250           # Hz
-HPF_HZ = 2
-LPF_HZ = 70.0
-NOTCH_HZ = 50.0
-
-# ============================================================
-# FUNCIONES DE FILTRADO
-# ============================================================
-def bandpass_filter(data, low=HPF_HZ, high=LPF_HZ, fs=FS, order=4):
-    nyq = 0.5 * fs
-    b, a = butter(order, [low / nyq, high / nyq], btype="band")
-    return filtfilt(b, a, data)
-
-def notch_filter(data, f0=NOTCH_HZ, Q=30.0, fs=FS):
-    nyq = 0.5 * fs
-    b, a = iirnotch(f0 / nyq, Q)
-    return filtfilt(b, a, data)
-
-# ============================================================
-# FUNCIONES DE RE-REFERENCIADO ROBUSTO
-# ============================================================
-def mad(x):
-    """Median Absolute Deviation (robusto a outliers)."""
-    m = np.median(x)
-    return np.median(np.abs(x - m)) + 1e-12
-
-def estimate_ab_robust(x, r, fs, trim_s=1.0, k=6.0):
-    """Estima a,b en X ≈ a·R + b usando mínimos cuadrados robustos."""
-    i0 = int(trim_s * fs)
-    i1 = len(x) - i0 if len(x) > 2 * i0 else len(x)
-    x1 = x[i0:i1].copy()
-    r1 = r[i0:i1].copy()
-    x1c = x1 - np.median(x1)
-    r1c = r1 - np.median(r1)
-    mask = (np.abs(x1c) < k * mad(x1c)) & (np.abs(r1c) < k * mad(r1c))
-    if np.sum(mask) < 10:
-        mask = np.ones_like(x1c, dtype=bool)
-    Xmat = np.column_stack([r1c[mask], np.ones(np.sum(mask))])
-    a, b = np.linalg.lstsq(Xmat, x1c[mask], rcond=None)[0]
-    return float(a), float(b)
+FS = 250  # Hz (para referencia futura)
 
 # ============================================================
 # ENDPOINTS DE API
 # ============================================================
 @app.get("/")
 async def root():
-    return {"message": "Servidor funcionando ✅"}
+    return {"message": "Servidor funcionando ✅ (modo RAW)"}
+
 
 @app.get("/signals/processed")
 async def get_signals_processed(limit: int = Query(7500, ge=1, le=10000)):
@@ -95,10 +56,11 @@ async def get_signals_processed(limit: int = Query(7500, ge=1, le=10000)):
 # ============================================================
 clients = set()
 
+
 @app.websocket("/ws")  # conexión desde app Android
 async def websocket_pcb(websocket: WebSocket):
     await websocket.accept()
-    print("📡 PCB conectada al WebSocket")
+    print("📡 PCB conectada al WebSocket (modo RAW)")
 
     try:
         while True:
@@ -115,39 +77,34 @@ async def websocket_pcb(websocket: WebSocket):
                 continue
 
             try:
-                # 🔹 Filtrado notch + banda
-                ch1_bp = bandpass_filter(notch_filter(ch1))
-                ch2_bp = bandpass_filter(notch_filter(ch2))
+                # 🔹 Señal RAW combinada o promedio (puedes cambiar a solo CH1 o CH2)
+                # Aquí guardaremos el promedio simple de CH1 y CH2 como valor representativo
+                y_raw = (ch1 + ch2) / 2.0
 
-                # 🔹 Re-referenciado robusto
-                a_r, b_r = estimate_ab_robust(ch1_bp, ch2_bp, fs=FS, trim_s=1.0, k=6.0)
-                y_rr = ch1_bp - a_r * ch2_bp - b_r
-                print(f"🔹 Re-referenciado robusto: a={a_r:.6f}, b={b_r:.6f}")
-
-                # 🔹 Guardar en base de datos (solo señal re-referenciada)
+                # 🔹 Guardar en base de datos (solo señal RAW)
                 cursor.executemany(
                     "INSERT INTO brain_signals_processed (device_id, value_uv) VALUES (%s, %s)",
-                    [("pcb_001", float(v)) for v in y_rr],
+                    [("pcb_001", float(v)) for v in y_raw],
                 )
                 conn.commit()
 
-                print(f"✅ {datetime.now()} - Guardadas {len(y_rr)} muestras re-referenciadas")
+                print(f"✅ {datetime.now()} - Guardadas {len(y_raw)} muestras RAW")
 
             except Exception as e:
                 conn.rollback()
-                print("⚠️ Error durante el procesamiento:", e)
+                print("⚠️ Error durante guardado en base de datos:", e)
                 continue
 
             # Confirmación a la app Android
             await websocket.send_text(
-                f"Guardadas {len(y_rr)} re-referenciadas filtradas"
+                f"Guardadas {len(y_raw)} muestras RAW"
             )
 
             # 🔹 Reenviar a clientes conectados (frontend)
             dead_clients = []
             for client in clients:
                 try:
-                    await client.send_bytes(y_rr.astype("<f4").tobytes())
+                    await client.send_bytes(y_raw.astype("<f4").tobytes())
                 except:
                     dead_clients.append(client)
 
@@ -159,11 +116,12 @@ async def websocket_pcb(websocket: WebSocket):
     finally:
         print("❌ PCB desconectada")
 
+
 @app.websocket("/ws/client")  # frontend -> servidor
 async def websocket_client(websocket: WebSocket):
     await websocket.accept()
     clients.add(websocket)
-    print("👀 Cliente conectado al WebSocket")
+    print("👀 Cliente conectado al WebSocket (modo RAW)")
 
     try:
         while True:
