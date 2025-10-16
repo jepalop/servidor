@@ -4,3 +4,4 @@ psycopg2-binary
 websockets
 numpy
 scipy
+PyWavelets>=1.6.0
