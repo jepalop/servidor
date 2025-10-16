@@ -36,7 +36,7 @@ FS = 250  # Hz (para referencia futura)
 # ============================================================
 @app.get("/")
 async def root():
-    return {"message": "Servidor funcionando ✅ (modo RAW)"}
+    return {"message": "Servidor funcionando"}
 
 
 @app.get("/signals/processed")
@@ -60,7 +60,7 @@ clients = set()
 @app.websocket("/ws")  # conexión desde app Android
 async def websocket_pcb(websocket: WebSocket):
     await websocket.accept()
-    print("📡 PCB conectada al WebSocket (modo RAW)")
+    print("PCB conectada al WebSocket")
 
     try:
         while True:
@@ -77,18 +77,16 @@ async def websocket_pcb(websocket: WebSocket):
                 continue
 
             try:
-                # 🔹 Señal RAW combinada o promedio (puedes cambiar a solo CH1 o CH2)
-                # Aquí guardaremos el promedio simple de CH1 y CH2 como valor representativo
-                y_raw = (ch1 + ch2) / 2.0
+                ref = np.median(np.vstack([ch1, ch2]), axis=0)
+                y_raw = ch1 - ref
 
-                # 🔹 Guardar en base de datos (solo señal RAW)
                 cursor.executemany(
                     "INSERT INTO brain_signals_processed (device_id, value_uv) VALUES (%s, %s)",
                     [("pcb_001", float(v)) for v in y_raw],
                 )
                 conn.commit()
 
-                print(f"✅ {datetime.now()} - Guardadas {len(y_raw)} muestras RAW")
+                print(f"✅ {datetime.now()} - Guardadas {len(y_raw)} muestras re-referenciadas robustamente")
 
             except Exception as e:
                 conn.rollback()
@@ -97,10 +95,9 @@ async def websocket_pcb(websocket: WebSocket):
 
             # Confirmación a la app Android
             await websocket.send_text(
-                f"Guardadas {len(y_raw)} muestras RAW"
+                f"Guardadas {len(y_raw)} muestras re-referenciadas"
             )
 
-            # 🔹 Reenviar a clientes conectados (frontend)
             dead_clients = []
             for client in clients:
                 try:
@@ -112,23 +109,23 @@ async def websocket_pcb(websocket: WebSocket):
                 clients.remove(dc)
 
     except Exception as e:
-        print("⚠️ Error WebSocket PCB:", e)
+        print("Error WebSocket PCB:", e)
     finally:
-        print("❌ PCB desconectada")
+        print("PCB desconectada")
 
 
 @app.websocket("/ws/client")  # frontend -> servidor
 async def websocket_client(websocket: WebSocket):
     await websocket.accept()
     clients.add(websocket)
-    print("👀 Cliente conectado al WebSocket (modo RAW)")
+    print("Cliente conectado al WebSocket")
 
     try:
         while True:
             await asyncio.sleep(1)
     except Exception as e:
-        print("⚠️ Error WebSocket cliente:", e)
+        print("Error WebSocket cliente:", e)
     finally:
         if websocket in clients:
             clients.remove(websocket)
-        print("👋 Cliente desconectado")
+        print("Cliente desconectado")
