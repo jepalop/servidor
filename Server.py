@@ -6,6 +6,7 @@ from fastapi import FastAPI, WebSocket, Query
 from fastapi.middleware.cors import CORSMiddleware
 import asyncio
 from scipy.signal import butter, filtfilt, iirnotch
+import pywt
 
 # ============================================================
 # CONFIGURACIÓN BÁSICA FASTAPI + CORS
@@ -37,33 +38,45 @@ NOTCH_HZ = 50.0 # Notch
 Q = 30.0        # Factor de calidad notch
 ORDER = 4       # Orden de filtros Butterworth
 
+# Parámetros de wavelet denoising
+WAVELET_TYPE = "db4"
+WAVELET_LEVEL = 4
+
 # ============================================================
 # FUNCIONES DE FILTRADO
 # ============================================================
 def apply_notch_filter(signal, fs=FS, f0=NOTCH_HZ, Q=Q):
-    """Filtro notch (rechaza 50 Hz)"""
     b, a = iirnotch(f0 / (fs / 2), Q)
     return filtfilt(b, a, signal)
 
 def apply_bandpass(signal, fs=FS, low=HPF_HZ, high=LPF_HZ, order=ORDER):
-    """Filtro pasa banda (1–70 Hz) compuesto de HP + LP"""
     nyq = 0.5 * fs
     b, a = butter(order, [low / nyq, high / nyq], btype='band')
     return filtfilt(b, a, signal)
 
 def apply_all_filters(signal):
-    """Secuencia completa de filtros: HP → Notch → LP"""
-    x = apply_bandpass(signal)  # HP + LP juntos
+    x = apply_bandpass(signal)  # HP + LP
     x = apply_notch_filter(x)   # Notch 50 Hz
     return x
+
+# ============================================================
+# FUNCIÓN DE DENOISING POR WAVELETS
+# ============================================================
+def wavelet_denoise(signal, wavelet=WAVELET_TYPE, level=WAVELET_LEVEL):
+    coeffs = pywt.wavedec(signal, wavelet, level=level)
+    # Eliminamos bajas frecuencias (componente de tendencia)
+    coeffs[0] = np.zeros_like(coeffs[0])
+    clean = pywt.waverec(coeffs, wavelet)
+    return clean[:len(signal)]
 
 # ============================================================
 # ENDPOINTS DE API
 # ============================================================
 @app.get("/")
 async def root():
-    return {"message": "Servidor funcionando con filtros HP(1Hz) + Notch(50Hz) + LP(70Hz)"}
-
+    return {
+        "message": "Servidor funcionando con filtros HP(1Hz)+Notch(50Hz)+LP(70Hz)+Wavelet(db4,L4)"
+    }
 
 @app.get("/signals/processed")
 async def get_signals_processed(limit: int = Query(7500, ge=1, le=10000)):
@@ -82,11 +95,10 @@ async def get_signals_processed(limit: int = Query(7500, ge=1, le=10000)):
 # ============================================================
 clients = set()
 
-
 @app.websocket("/ws")  # conexión desde app Android
 async def websocket_pcb(websocket: WebSocket):
     await websocket.accept()
-    print("PCB conectada al WebSocket (modo filtrado)")
+    print("PCB conectada al WebSocket (modo filtrado + wavelet)")
 
     try:
         while True:
@@ -107,17 +119,20 @@ async def websocket_pcb(websocket: WebSocket):
                 ref = np.median(np.vstack([ch1, ch2]), axis=0)
                 y_reref = ch1 - ref
 
-                # Aplicar filtros HP(1Hz) + Notch(50Hz) + LP(70Hz)
+                # Filtros HP(1Hz) + Notch(50Hz) + LP(70Hz)
                 y_filt = apply_all_filters(y_reref)
 
-                # Guardar señal filtrada en la base de datos
+                # Denoising con wavelets (db4, nivel 4)
+                y_clean = wavelet_denoise(y_filt)
+
+                # Guardar señal final (filtrada + limpia) en la base de datos
                 cursor.executemany(
                     "INSERT INTO brain_signals_processed (device_id, value_uv) VALUES (%s, %s)",
-                    [("pcb_001", float(v)) for v in y_filt],
+                    [("pcb_001", float(v)) for v in y_clean],
                 )
                 conn.commit()
 
-                print(f"{datetime.now()} - Guardadas {len(y_filt)} muestras filtradas (HP+Notch+LP)")
+                print(f"{datetime.now()} - Guardadas {len(y_clean)} muestras (HP+Notch+LP+Wavelet)")
 
             except Exception as e:
                 conn.rollback()
@@ -126,14 +141,14 @@ async def websocket_pcb(websocket: WebSocket):
 
             # Confirmación a la app Android
             await websocket.send_text(
-                f"Guardadas {len(y_filt)} muestras filtradas (HP+Notch+LP)"
+                f"Guardadas {len(y_clean)} muestras filtradas y limpias (HP+Notch+LP+Wavelet)"
             )
 
             # Reenviar a clientes conectados (frontend)
             dead_clients = []
             for client in clients:
                 try:
-                    await client.send_bytes(y_filt.astype("<f4").tobytes())
+                    await client.send_bytes(y_clean.astype("<f4").tobytes())
                 except:
                     dead_clients.append(client)
 
@@ -145,12 +160,11 @@ async def websocket_pcb(websocket: WebSocket):
     finally:
         print("PCB desconectada")
 
-
 @app.websocket("/ws/client")  # frontend -> servidor
 async def websocket_client(websocket: WebSocket):
     await websocket.accept()
     clients.add(websocket)
-    print("Cliente conectado al WebSocket (modo filtrado)")
+    print("Cliente conectado al WebSocket (modo filtrado + wavelet)")
 
     try:
         while True:
