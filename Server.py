@@ -4,174 +4,161 @@ import numpy as np
 from datetime import datetime
 from fastapi import FastAPI, WebSocket, Query
 from fastapi.middleware.cors import CORSMiddleware
-import asyncio
 from scipy.signal import butter, filtfilt, iirnotch
-import pywt
+import asyncio
 
-# ============================================================
-# CONFIGURACIÓN BÁSICA FASTAPI + CORS
-# ============================================================
 app = FastAPI()
 
+# =====================
+# Configuración CORS
+# =====================
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*", "http://localhost:5173"],
+    allow_origins=[
+        "http://localhost:5173",
+        "*",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ============================================================
-# CONEXIÓN A BASE DE DATOS
-# ============================================================
+# =====================
+# Conexión a PostgreSQL
+# =====================
 DB_URL = os.getenv("DATABASE_URL")
-conn = psycopg2.connect(DB_URL)
-cursor = conn.cursor()
 
-# ============================================================
-# PARÁMETROS DE SEÑAL Y FILTROS
-# ============================================================
-FS = 250        # Frecuencia de muestreo (Hz)
-HPF_HZ = 1.0    # Pasa alto
-LPF_HZ = 70.0   # Pasa bajo
-NOTCH_HZ = 50.0 # Notch
-Q = 30.0        # Factor de calidad notch
-ORDER = 4       # Orden de filtros Butterworth
+def connect_db():
+    """Abre nueva conexión y cursor"""
+    conn = psycopg2.connect(DB_URL)
+    conn.autocommit = False
+    return conn, conn.cursor()
 
-# Parámetros de wavelet denoising
-WAVELET_TYPE = "db4"
-WAVELET_LEVEL = 4
+conn, cursor = connect_db()
 
-# ============================================================
-# FUNCIONES DE FILTRADO
-# ============================================================
-def apply_notch_filter(signal, fs=FS, f0=NOTCH_HZ, Q=Q):
-    b, a = iirnotch(f0 / (fs / 2), Q)
-    return filtfilt(b, a, signal)
+def get_cursor():
+    """Verifica que la conexión siga viva"""
+    global conn, cursor
+    try:
+        cursor.execute("SELECT 1;")
+    except (Exception, psycopg2.Error):
+        print("🔄 Reabriendo conexión a PostgreSQL...")
+        conn, cursor = connect_db()
+    return cursor
 
-def apply_bandpass(signal, fs=FS, low=HPF_HZ, high=LPF_HZ, order=ORDER):
+# =====================
+# Parámetros de señal
+# =====================
+FS = 250  # Hz
+
+def bandpass_filter(data, low=1, high=40, fs=FS, order=2):  # 🔹 más liviano
     nyq = 0.5 * fs
-    b, a = butter(order, [low / nyq, high / nyq], btype='band')
-    return filtfilt(b, a, signal)
+    b, a = butter(order, [low / nyq, high / nyq], btype="band")
+    return filtfilt(b, a, data)
 
-def apply_all_filters(signal):
-    x = apply_bandpass(signal)  # HP + LP
-    x = apply_notch_filter(x)   # Notch 50 Hz
-    return x
+def notch_filter(data, f0=50.0, Q=30.0, fs=FS):
+    nyq = 0.5 * fs
+    b, a = iirnotch(f0 / nyq, Q)
+    return filtfilt(b, a, data)
 
-# ============================================================
-# FUNCIÓN DE DENOISING POR WAVELETS
-# ============================================================
-def wavelet_denoise(signal, wavelet=WAVELET_TYPE, level=WAVELET_LEVEL):
-    coeffs = pywt.wavedec(signal, wavelet, level=level)
-    # Eliminamos bajas frecuencias (componente de tendencia)
-    coeffs[0] = np.zeros_like(coeffs[0])
-    clean = pywt.waverec(coeffs, wavelet)
-    return clean[:len(signal)]
+def apply_filters(values):
+    arr = np.array(values, dtype=np.float32)
+    arr = notch_filter(arr, f0=50.0)
+    arr = bandpass_filter(arr, 1, 40)
+    return arr.tolist()
 
-# ============================================================
-# ENDPOINTS DE API
-# ============================================================
-@app.get("/")
+# =====================
+# API REST
+# =====================
+@app.api_route("/", methods=["GET", "HEAD"])
 async def root():
-    return {
-        "message": "Servidor funcionando con filtros HP(1Hz)+Notch(50Hz)+LP(70Hz)+Wavelet(db4,L4)"
-    }
+    return {"message": "Servidor funcionando ✅"}
 
 @app.get("/signals/processed")
-async def get_signals_processed(limit: int = Query(7500, ge=1, le=10000)):
-    cursor.execute(
+async def get_signals_processed(limit: int = Query(750, ge=1, le=10000)):
+    c = get_cursor()
+    c.execute(
         "SELECT id, timestamp, device_id, value_uv FROM brain_signals_processed ORDER BY id DESC LIMIT %s;",
         (limit,),
     )
-    rows = cursor.fetchall()
+    rows = c.fetchall()
     return [
         {"id": r[0], "timestamp": r[1], "device_id": r[2], "value_uv": float(r[3])}
         for r in rows
     ]
 
-# ============================================================
-# WEBSOCKETS
-# ============================================================
+# =====================
+# WebSockets
+# =====================
 clients = set()
 
-@app.websocket("/ws")  # conexión desde app Android
+@app.websocket("/ws")  # PCB → Servidor
 async def websocket_pcb(websocket: WebSocket):
     await websocket.accept()
-    print("PCB conectada al WebSocket (modo filtrado + wavelet)")
+    print("📡 PCB conectado al WebSocket")
 
     try:
         while True:
             data_bytes = await websocket.receive_bytes()
-            print(f"{datetime.now()} - Paquete recibido: {len(data_bytes)} bytes")
+            print(f"📩 {datetime.now()} - Paquete recibido: {len(data_bytes)} bytes")
 
             try:
-                # Decodificar pares de canales (CH1, CH2)
-                data = np.frombuffer(data_bytes, dtype="<f4").reshape(-1, 2)
-                ch1 = data[:, 0]
-                ch2 = data[:, 1]
+                values = np.frombuffer(data_bytes, dtype="<f4").astype(float).tolist()
             except Exception as e:
-                print("Error al decodificar:", e)
+                print("❌ Error al decodificar paquete:", e)
                 continue
 
             try:
-                # Re-referenciado robusto
-                ref = np.median(np.vstack([ch1, ch2]), axis=0)
-                y_reref = ch1 - ref
+                c = get_cursor()
+                filtered = apply_filters(values)
 
-                # Filtros HP(1Hz) + Notch(50Hz) + LP(70Hz)
-                y_filt = apply_all_filters(y_reref)
-
-                # Denoising con wavelets (db4, nivel 4)
-                y_clean = wavelet_denoise(y_filt)
-
-                # Guardar señal final (filtrada + limpia) en la base de datos
-                cursor.executemany(
+                # 🔹 Solo guardar señal filtrada
+                c.executemany(
                     "INSERT INTO brain_signals_processed (device_id, value_uv) VALUES (%s, %s)",
-                    [("pcb_001", float(v)) for v in y_clean],
+                    [("pcb_001", fv) for fv in filtered],
                 )
-                conn.commit()
 
-                print(f"{datetime.now()} - Guardadas {len(y_clean)} muestras (HP+Notch+LP+Wavelet)")
+                conn.commit()
+                print(f"✅ {datetime.now()} - Guardados {len(filtered)} datos filtrados")
 
             except Exception as e:
                 conn.rollback()
-                print("Error durante procesado o guardado:", e)
-                continue
+                cursor = conn.cursor()
+                print("⚠️ Error al insertar en DB:", e)
 
-            # Confirmación a la app Android
-            await websocket.send_text(
-                f"Guardadas {len(y_clean)} muestras filtradas y limpias (HP+Notch+LP+Wavelet)"
-            )
+            # Confirmar a la PCB
+            await websocket.send_text(f"Guardados {len(values)} filtrados")
 
-            # Reenviar a clientes conectados (frontend)
+            # 🔹 Reenviar a todos los clientes conectados (filtrados)
+            filtered_bytes = np.array(filtered, dtype="<f4").tobytes()
             dead_clients = []
             for client in clients:
                 try:
-                    await client.send_bytes(y_clean.astype("<f4").tobytes())
+                    await client.send_bytes(filtered_bytes)
                 except:
                     dead_clients.append(client)
-
             for dc in dead_clients:
                 clients.remove(dc)
 
     except Exception as e:
-        print("Error WebSocket PCB:", e)
+        print("⚠️ Error en WebSocket PCB:", e)
     finally:
-        print("PCB desconectada")
+        print("❌ PCB desconectado")
 
-@app.websocket("/ws/client")  # frontend -> servidor
+@app.websocket("/ws/client")
 async def websocket_client(websocket: WebSocket):
     await websocket.accept()
     clients.add(websocket)
-    print("Cliente conectado al WebSocket (modo filtrado + wavelet)")
+    print("👀 Cliente conectado al WebSocket")
 
     try:
         while True:
-            await asyncio.sleep(1)
+            # 🔹 Mantiene viva la conexión
+            await websocket.send_text("ping")
+            await asyncio.sleep(15)
     except Exception as e:
-        print("Error WebSocket cliente:", e)
+        print("⚠️ Error en WebSocket cliente:", e)
     finally:
         if websocket in clients:
             clients.remove(websocket)
-        print("Cliente desconectado")
+        print("👋 Cliente desconectado")
