@@ -1,29 +1,32 @@
 import os
 import psycopg2
 import numpy as np
+import json
 from datetime import datetime
 from fastapi import FastAPI, WebSocket, Query
 from fastapi.middleware.cors import CORSMiddleware
 from scipy.signal import butter, filtfilt, iirnotch
 import asyncio
-import json
 
 app = FastAPI()
 
-# =========================================================
+# ============================================================
 # CORS
-# =========================================================
+# ============================================================
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*", "http://localhost:5173"],
+    allow_origins=[
+        "http://localhost:5173",
+        "*",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# =========================================================
-# PostgreSQL connection
-# =========================================================
+# ============================================================
+# Conexión a PostgreSQL
+# ============================================================
 DB_URL = os.getenv("DATABASE_URL")
 
 def connect_db():
@@ -42,9 +45,9 @@ def get_cursor():
         conn, cursor = connect_db()
     return cursor
 
-# =========================================================
-# Signal processing parameters
-# =========================================================
+# ============================================================
+# Parámetros de señal
+# ============================================================
 FS = 250  # Hz
 
 def bandpass_filter(data, low=1, high=40, fs=FS, order=2):
@@ -63,10 +66,10 @@ def apply_filters(values):
     arr = bandpass_filter(arr, 1, 40)
     return arr.tolist()
 
-# =========================================================
-# API REST endpoints
-# =========================================================
-@app.get("/")
+# ============================================================
+# API REST
+# ============================================================
+@app.api_route("/", methods=["GET", "HEAD"])
 async def root():
     return {"message": "Servidor funcionando ✅"}
 
@@ -83,23 +86,13 @@ async def get_signals_processed(limit: int = Query(750, ge=1, le=10000)):
         for r in rows
     ]
 
-# =========================================================
-# WebSocket logic
-# =========================================================
+# ============================================================
+# WebSockets
+# ============================================================
 clients = set()
 
 @app.websocket("/ws")
 async def websocket_pcb(websocket: WebSocket):
-    """
-    Recibe paquetes JSON desde la app Android:
-    {
-        "timestamp_start": 1698418835123,
-        "channels": {
-            "Neurona_front": [...],
-            "Neurona_ref": [...]
-        }
-    }
-    """
     await websocket.accept()
     print("📡 App Android conectada al WebSocket")
 
@@ -123,6 +116,10 @@ async def websocket_pcb(websocket: WebSocket):
                 # Igualar longitudes
                 n = min(len(front), len(ref))
                 front, ref = front[:n], ref[:n]
+
+                # 🔹 Convertir a float antes de operaciones NumPy
+                front = np.array([float(x) for x in front], dtype=np.float32)
+                ref = np.array([float(x) for x in ref], dtype=np.float32)
 
                 # Re-referenciar
                 reref = np.subtract(front, ref)
@@ -149,7 +146,7 @@ async def websocket_pcb(websocket: WebSocket):
                 # Confirmar a la app
                 await websocket.send_text(f"Guardadas {len(filtered_reref)} muestras procesadas")
 
-                # Enviar a clientes conectados
+                # Enviar a clientes conectados (si hay dashboard, por ejemplo)
                 filtered_bytes = np.array(filtered_reref, dtype="<f4").tobytes()
                 dead_clients = []
                 for client in clients:
@@ -167,26 +164,22 @@ async def websocket_pcb(websocket: WebSocket):
                 print("⚠️ Error procesando paquete:", e)
 
     except Exception as e:
-        print("⚠️ Error en WebSocket principal:", e)
+        print(f"⚠️ Error en WebSocket principal: {e}")
     finally:
         print("❌ App desconectada del WebSocket")
 
-
 @app.websocket("/ws/client")
 async def websocket_client(websocket: WebSocket):
-    """
-    Cliente de monitorización (por ejemplo, dashboard web).
-    """
     await websocket.accept()
     clients.add(websocket)
-    print("👀 Cliente de visualización conectado")
+    print("👀 Cliente conectado al WebSocket")
 
     try:
         while True:
             await websocket.send_text("ping")
             await asyncio.sleep(15)
-    except Exception:
-        pass
+    except Exception as e:
+        print("⚠️ Error en WebSocket cliente:", e)
     finally:
         if websocket in clients:
             clients.remove(websocket)
