@@ -1,54 +1,46 @@
 import os
 import psycopg2
 import numpy as np
-import json
-from datetime import datetime
-from fastapi import FastAPI, WebSocket, Query
+from datetime import datetime, timedelta
+from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from scipy.signal import butter, filtfilt, iirnotch
 import asyncio
 
 app = FastAPI()
 
-# ============================================================
-# CORS
-# ============================================================
+# =====================
+# CONFIG CORS
+# =====================
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "*",
-    ],
+    allow_origins=["*", "http://localhost:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ============================================================
-# Conexión a PostgreSQL
-# ============================================================
+# =====================
+# DATABASE
+# =====================
 DB_URL = os.getenv("DATABASE_URL")
-
-def connect_db():
-    conn = psycopg2.connect(DB_URL)
-    conn.autocommit = False
-    return conn, conn.cursor()
-
-conn, cursor = connect_db()
+conn = psycopg2.connect(DB_URL)
+conn.autocommit = False
+cursor = conn.cursor()
 
 def get_cursor():
     global conn, cursor
     try:
         cursor.execute("SELECT 1;")
-    except (Exception, psycopg2.Error):
-        print("🔄 Reabriendo conexión a PostgreSQL...")
-        conn, cursor = connect_db()
+    except:
+        conn = psycopg2.connect(DB_URL)
+        cursor = conn.cursor()
     return cursor
 
-# ============================================================
-# Parámetros de señal
-# ============================================================
-FS = 250  # Hz
+# =====================
+# FILTERS
+# =====================
+FS = 250
 
 def bandpass_filter(data, low=1, high=40, fs=FS, order=2):
     nyq = 0.5 * fs
@@ -66,121 +58,46 @@ def apply_filters(values):
     arr = bandpass_filter(arr, 1, 40)
     return arr.tolist()
 
-# ============================================================
-# API REST
-# ============================================================
-@app.api_route("/", methods=["GET", "HEAD"])
-async def root():
-    return {"message": "Servidor funcionando ✅"}
-
-@app.get("/signals/processed")
-async def get_signals_processed(limit: int = Query(750, ge=1, le=10000)):
-    c = get_cursor()
-    c.execute(
-        "SELECT id, timestamp, device_id, value_uv FROM brain_signals_processed ORDER BY id DESC LIMIT %s;",
-        (limit,),
-    )
-    rows = c.fetchall()
-    return [
-        {"id": r[0], "timestamp": r[1], "device_id": r[2], "value_uv": float(r[3])}
-        for r in rows
-    ]
-
-# ============================================================
-# WebSockets
-# ============================================================
-clients = set()
-
+# =====================
+# WEBSOCKET ENDPOINT
+# =====================
 @app.websocket("/ws")
-async def websocket_pcb(websocket: WebSocket):
+async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     print("📡 App Android conectada al WebSocket")
 
     try:
         while True:
-            message = await websocket.receive_text()
-            timestamp_received = datetime.now()
-
+            data = await websocket.receive_bytes()
             try:
-                data = json.loads(message)
-                timestamp_start = data.get("timestamp_start")
-                channels = data.get("channels", {})
-                front = channels.get("Neurona_front", [])
-                ref = channels.get("Neurona_ref", [])
+                floats = np.frombuffer(data, dtype="<f4")
+                data_pairs = floats.reshape(-1, 2)
+                front = data_pairs[:, 0]
+                ref = data_pairs[:, 1]
+                reref = front - ref
 
-                # Verificación
-                if not front or not ref:
-                    print("⚠️ Paquete JSON incompleto (faltan canales)")
-                    continue
-
-                # Igualar longitudes
-                n = min(len(front), len(ref))
-                front, ref = front[:n], ref[:n]
-
-                # 🔹 Convertir a float antes de operaciones NumPy
-                front = np.array([float(x) for x in front], dtype=np.float32)
-                ref = np.array([float(x) for x in ref], dtype=np.float32)
-
-                # Re-referenciar
-                reref = np.subtract(front, ref)
-
-                # Filtrar señal
-                filtered_reref = apply_filters(reref)
-
-                # Calcular timestamps individuales
+                filtered = apply_filters(reref)
                 timestamps = [
-                    datetime.fromtimestamp((timestamp_start / 1000.0) + i / FS)
-                    for i in range(len(filtered_reref))
+                    datetime.now() + timedelta(seconds=i / FS)
+                    for i in range(len(filtered))
                 ]
 
-                # Guardar en base de datos
                 c = get_cursor()
                 c.executemany(
                     "INSERT INTO brain_signals_processed (device_id, timestamp, value_uv) VALUES (%s, %s, %s)",
-                    [("reref", ts, float(v)) for ts, v in zip(timestamps, filtered_reref)],
+                    [("reref", ts, float(v)) for ts, v in zip(timestamps, filtered)],
                 )
                 conn.commit()
+                print(f"✅ Guardadas {len(filtered)} muestras re-referenciadas")
 
-                print(f"✅ {timestamp_received} - Guardadas {len(filtered_reref)} muestras re-referenciadas")
+                await websocket.send_text(f"OK:{len(filtered)}")
 
-                # Confirmar a la app
-                await websocket.send_text(f"Guardadas {len(filtered_reref)} muestras procesadas")
-
-                # Enviar a clientes conectados (si hay dashboard, por ejemplo)
-                filtered_bytes = np.array(filtered_reref, dtype="<f4").tobytes()
-                dead_clients = []
-                for client in clients:
-                    try:
-                        await client.send_bytes(filtered_bytes)
-                    except:
-                        dead_clients.append(client)
-                for dc in dead_clients:
-                    clients.remove(dc)
-
-            except json.JSONDecodeError:
-                print("⚠️ Error: paquete no es JSON válido")
             except Exception as e:
                 conn.rollback()
                 print("⚠️ Error procesando paquete:", e)
+                await websocket.send_text(f"ERROR:{e}")
 
     except Exception as e:
-        print(f"⚠️ Error en WebSocket principal: {e}")
+        print("⚠️ Error en WebSocket:", e)
     finally:
         print("❌ App desconectada del WebSocket")
-
-@app.websocket("/ws/client")
-async def websocket_client(websocket: WebSocket):
-    await websocket.accept()
-    clients.add(websocket)
-    print("👀 Cliente conectado al WebSocket")
-
-    try:
-        while True:
-            await websocket.send_text("ping")
-            await asyncio.sleep(15)
-    except Exception as e:
-        print("⚠️ Error en WebSocket cliente:", e)
-    finally:
-        if websocket in clients:
-            clients.remove(websocket)
-        print("👋 Cliente desconectado")
