@@ -4,7 +4,6 @@ import numpy as np
 from datetime import datetime, timedelta
 from fastapi import FastAPI, WebSocket, Query
 from fastapi.middleware.cors import CORSMiddleware
-from scipy.signal import butter, sosfiltfilt, iirnotch
 from psycopg2.extras import execute_batch
 
 # ============================================================
@@ -43,40 +42,9 @@ def get_cursor():
     return cursor
 
 # ============================================================
-# FILTROS EEG
-# ============================================================
-FS = 250  # Frecuencia de muestreo (Hz)
-
-def butter_filter(lowcut=None, highcut=None, fs=FS, order=4):
-    nyq = 0.5 * fs
-    if lowcut and highcut:
-        sos = butter(order, [lowcut / nyq, highcut / nyq], btype="band", output="sos")
-    elif lowcut:
-        sos = butter(order, lowcut / nyq, btype="high", output="sos")
-    elif highcut:
-        sos = butter(order, highcut / nyq, btype="low", output="sos")
-    else:
-        raise ValueError("Debe especificarse lowcut o highcut")
-    return sos
-
-def notch_filter(data, f0=50.0, Q=30.0, fs=FS):
-    nyq = 0.5 * fs
-    b, a = iirnotch(f0 / nyq, Q)
-    sos = np.array([[b[0], b[1], b[2], 1, a[1], a[2]]])
-    return sosfiltfilt(sos, data)
-
-# Precalcular filtros
-SOS_BP = butter_filter(0.5, 70, fs=FS, order=4)
-
-def apply_filters(values):
-    arr = np.asarray(values, dtype=np.float32)
-    arr = notch_filter(arr, f0=50.0, Q=30.0)
-    arr = sosfiltfilt(SOS_BP, arr)
-    return arr.tolist()
-
-# ============================================================
 # VARIABLES GLOBALES DE SINCRONIZACIÓN
 # ============================================================
+FS = 250  # Frecuencia de muestreo (Hz)
 start_time = None
 sample_counter = 0
 
@@ -85,7 +53,7 @@ sample_counter = 0
 # ============================================================
 @app.get("/")
 async def root():
-    return {"message": "🧠 Servidor activo y listo (sincronización continua habilitada)"}
+    return {"message": "🧠 Servidor activo y listo (solo re-referenciado, sin filtrado)"}
 
 # ============================================================
 # WEBSOCKET — RECEPCIÓN DE DATOS BINARIOS
@@ -131,11 +99,6 @@ async def websocket_endpoint(websocket: WebSocket):
                 reref = front - ref
 
                 # ============================================================
-                # 🔹 Filtrado (opcional)
-                # ============================================================
-                filtered = apply_filters(reref)
-
-                # ============================================================
                 # 🕒 Timestamps continuos
                 # ============================================================
                 if start_time is None:
@@ -144,9 +107,9 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 timestamps = [
                     start_time + timedelta(seconds=(sample_counter + i) / FS)
-                    for i in range(len(filtered))
+                    for i in range(len(reref))
                 ]
-                sample_counter += len(filtered)
+                sample_counter += len(reref)
 
                 # ============================================================
                 # 💾 Inserción a base de datos
@@ -158,17 +121,17 @@ async def websocket_endpoint(websocket: WebSocket):
                     INSERT INTO brain_signals_processed (device_id, timestamp, value_uv)
                     VALUES (%s, %s, %s)
                     """,
-                    [("reref", ts, float(v)) for ts, v in zip(timestamps, filtered)],
+                    [("reref", ts, float(v)) for ts, v in zip(timestamps, reref)],
                     page_size=500,
                 )
                 conn.commit()
 
                 print(
-                    f"✅ {len(filtered)} muestras procesadas "
+                    f"✅ {len(reref)} muestras procesadas "
                     f"(lag={lag}, t0={timestamps[0].strftime('%H:%M:%S.%f')[:-3]})"
                 )
 
-                await websocket.send_text(f"OK:{len(filtered)}")
+                await websocket.send_text(f"OK:{len(reref)}")
 
             except Exception as e:
                 conn.rollback()
