@@ -1,6 +1,7 @@
 import os
 import psycopg2
 import numpy as np
+import struct
 from datetime import datetime, timedelta
 from fastapi import FastAPI, WebSocket, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -20,7 +21,7 @@ app.add_middleware(
 )
 
 # ============================================================
-# DATABASE
+# DATABASE CONNECTION
 # ============================================================
 DB_URL = os.getenv("DATABASE_URL")
 
@@ -44,103 +45,127 @@ def get_cursor():
 # ============================================================
 # CONFIGURACIÓN GLOBAL
 # ============================================================
-FS = 250  # Hz
-
-start_time = None
-sample_counter = 0
+FS_DEFAULT = 250  # Hz (valor de referencia)
+buffers = {1: [], 2: []}  # 1=front, 2=ref
 
 # ============================================================
-# ENDPOINT RAÍZ
+# ENDPOINT PRINCIPAL
 # ============================================================
 @app.get("/")
 async def root():
-    return {"message": "🧠 Servidor activo y listo (sincronización continua habilitada)"}
+    return {"message": "🧠 Servidor activo y listo (recepción binaria sincronizada habilitada)"}
 
 # ============================================================
-# WEBSOCKET — RECEPCIÓN DE DATOS BINARIOS (ROBUSTO)
+# PARSEO DE PAQUETE BINARIO (nuevo formato)
+# ============================================================
+def parse_binary_packet(packet_bytes):
+    """
+    Estructura esperada del paquete:
+    [device_id:1][timestamp_start:8][sample_rate:2][n_samples:2][floats:4*n]
+    """
+    header_fmt = "<Bqhh"
+    header_size = struct.calcsize(header_fmt)
+    if len(packet_bytes) < header_size:
+        print("⚠️ Paquete demasiado corto (sin cabecera)")
+        return None
+
+    device_id, ts_start, fs, n = struct.unpack_from(header_fmt, packet_bytes, 0)
+    if n <= 0 or n > 10000:
+        print(f"⚠️ Tamaño inválido n={n}")
+        return None
+
+    data_fmt = f"<{n}f"
+    expected_size = header_size + struct.calcsize(data_fmt)
+    if len(packet_bytes) < expected_size:
+        print("⚠️ Paquete incompleto, descartado")
+        return None
+
+    samples = struct.unpack_from(data_fmt, packet_bytes, header_size)
+    timestamps = [datetime.fromtimestamp(ts_start / 1000.0) + timedelta(seconds=i / fs) for i in range(n)]
+    return device_id, timestamps, samples
+
+# ============================================================
+# ALINEACIÓN Y RESTA SINCRONIZADA
+# ============================================================
+def align_and_subtract():
+    """
+    Busca timestamps coincidentes (o muy cercanos) entre front y ref.
+    Calcula front - ref y devuelve [(timestamp, value_uv)].
+    """
+    if not buffers[1] or not buffers[2]:
+        return []
+
+    front_ts, front_vals = zip(*buffers[1])
+    ref_ts, ref_vals = zip(*buffers[2])
+    ref_ts_np = np.array([ts.timestamp() for ts in ref_ts])
+    ref_vals_np = np.array(ref_vals)
+
+    results = []
+    for t, v_front in zip(front_ts, front_vals):
+        t_sec = t.timestamp()
+        idx = np.argmin(np.abs(ref_ts_np - t_sec))
+        if abs(ref_ts_np[idx] - t_sec) <= 0.004:  # tolerancia de 4 ms
+            diff = v_front - ref_vals_np[idx]
+            results.append((t, diff))
+
+    # Mantener últimas 100 muestras en buffers (por posibles retrasos)
+    buffers[1] = buffers[1][-100:]
+    buffers[2] = buffers[2][-100:]
+
+    return results
+
+# ============================================================
+# GUARDADO EN BASE DE DATOS
+# ============================================================
+def insert_processed_data(rows):
+    if not rows:
+        return
+    try:
+        c = get_cursor()
+        execute_batch(
+            c,
+            """
+            INSERT INTO brain_signals_processed (device_id, timestamp, value_uv)
+            VALUES (%s, %s, %s)
+            """,
+            [("reref", ts, float(val)) for ts, val in rows],
+            page_size=500,
+        )
+        conn.commit()
+        print(f"💾 Guardadas {len(rows)} muestras procesadas")
+    except Exception as e:
+        conn.rollback()
+        print("⚠️ Error al guardar en la BD:", e)
+
+# ============================================================
+# WEBSOCKET HANDLER
 # ============================================================
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    global start_time, sample_counter
     await websocket.accept()
     print("📡 App Android conectada al WebSocket")
 
-    buffer = bytearray()  # 🔹 acumulador binario
-
     try:
         while True:
-            # Recibir fragmento WS
-            chunk = await websocket.receive_bytes()
-            buffer.extend(chunk)
-            print(f"📦 Recibidos {len(chunk)} bytes (acumulado={len(buffer)})")
-
-            # Procesar solo si hay suficientes datos (~2000 floats = 8 kB)
-            if len(buffer) < 2000 * 4:
+            packet_bytes = await websocket.receive_bytes()
+            parsed = parse_binary_packet(packet_bytes)
+            if not parsed:
                 continue
 
-            # Convertir buffer a floats (little endian)
-            floats = np.frombuffer(buffer, dtype="<f4")
-            buffer.clear()  # vaciar para la siguiente tanda
+            device_id, timestamps, samples = parsed
+            buffers[device_id].extend(zip(timestamps, samples))
 
-            if len(floats) % 2 != 0:
-                print(f"⚠️ Paquete inválido ({len(floats)} floats), ignorado")
-                continue
-
-            # Separar canales
-            pairs = floats.reshape(-1, 2)
-            front = pairs[:, 0]
-            ref = pairs[:, 1]
-
-            reref = front - ref  # 🧮 Re-referenciado
-
-            if len(reref) < 10:
-                print(f"⚠️ Bloque corto ({len(reref)} muestras), saltado")
-                continue
-
-            # ============================================================
-            # TEMPORIZACIÓN Y ALMACENAMIENTO
-            # ============================================================
-            if start_time is None:
-                start_time = datetime.now()
-                sample_counter = 0
-
-            timestamps = [
-                start_time + timedelta(seconds=(sample_counter + i) / FS)
-                for i in range(len(reref))
-            ]
-            sample_counter += len(reref)
-
-            # ============================================================
-            # GUARDAR EN BASE DE DATOS
-            # ============================================================
-            try:
-                c = get_cursor()
-                execute_batch(
-                    c,
-                    """
-                    INSERT INTO brain_signals_processed (device_id, timestamp, value_uv)
-                    VALUES (%s, %s, %s)
-                    """,
-                    [("reref", ts, float(v)) for ts, v in zip(timestamps, reref)],
-                    page_size=500,
-                )
-                conn.commit()
-                print(f"✅ {len(reref)} muestras procesadas y guardadas (t0={timestamps[0]})")
-                await websocket.send_text(f"OK:{len(reref)}")
-
-            except Exception as e:
-                conn.rollback()
-                print("⚠️ Error procesando paquete:", e)
-                await websocket.send_text(f"ERROR:{e}")
-
+            results = align_and_subtract()
+            if results:
+                insert_processed_data(results)
+                await websocket.send_text(f"OK:{len(results)}")
     except Exception as e:
-        print("⚠️ Error en WebSocket principal:", e)
-
+        print("⚠️ Error en WebSocket:", e)
     finally:
         print("❌ App desconectada del WebSocket")
 
 # ============================================================
-# ENDPOINT REST — CONSULTA PARA EL FRONTEND
+# CONSULTA REST PARA EL FRONTEND
 # ============================================================
 @app.get("/signals/processed")
 async def get_signals_processed(limit: int = Query(750, ge=1, le=10000)):
