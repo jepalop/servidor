@@ -14,7 +14,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Render y localhost
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -43,7 +43,7 @@ def get_cursor():
     return cursor
 
 # ============================================================
-# FILTROS EEG MEJORADOS
+# FILTROS EEG
 # ============================================================
 FS = 250  # Frecuencia de muestreo (Hz)
 
@@ -62,7 +62,8 @@ def butter_filter(lowcut=None, highcut=None, fs=FS, order=4):
 def notch_filter(data, f0=50.0, Q=30.0, fs=FS):
     nyq = 0.5 * fs
     b, a = iirnotch(f0 / nyq, Q)
-    return sosfiltfilt(np.array([[b[0], b[1], b[2], 1, a[1], a[2]]]), data)
+    sos = np.array([[b[0], b[1], b[2], 1, a[1], a[2]]])
+    return sosfiltfilt(sos, data)
 
 # Precalcular filtros
 SOS_BP = butter_filter(0.5, 70, fs=FS, order=4)
@@ -74,7 +75,7 @@ def apply_filters(values):
     return arr.tolist()
 
 # ============================================================
-# VARIABLES GLOBALES DE SINCRONIZACIÓN TEMPORAL
+# VARIABLES GLOBALES DE SINCRONIZACIÓN
 # ============================================================
 start_time = None
 sample_counter = 0
@@ -98,23 +99,45 @@ async def websocket_endpoint(websocket: WebSocket):
     try:
         while True:
             data = await websocket.receive_bytes()
+
             try:
                 floats = np.frombuffer(data, dtype="<f4")
                 if len(floats) % 2 != 0:
-                    print("⚠️ Longitud de paquete inválida, ignorando")
+                    print("⚠️ Paquete con longitud inválida, ignorado")
                     continue
 
                 pairs = floats.reshape(-1, 2)
                 front = pairs[:, 0]
                 ref = pairs[:, 1]
 
-                # 🧮 Re-referenciado
+                # ============================================================
+                # 🔧 Alineación automática por correlación cruzada
+                # ============================================================
+                corr = np.correlate(front - np.mean(front), ref - np.mean(ref), mode="full")
+                lag = np.argmax(corr) - (len(ref) - 1)
+
+                if abs(lag) > 0:
+                    if lag > 0:
+                        front = front[lag:]
+                        ref = ref[:len(front)]
+                    elif lag < 0:
+                        ref = ref[-lag:]
+                        front = front[:len(ref)]
+                    print(f"🔧 Ajuste de desfase: {lag} muestras ({lag / FS:.3f}s)")
+
+                # ============================================================
+                # 🧮 Re-referenciado (Front - Ref)
+                # ============================================================
                 reref = front - ref
 
-                # 🔹 Filtrado
+                # ============================================================
+                # 🔹 Filtrado (opcional)
+                # ============================================================
                 filtered = apply_filters(reref)
 
-                # Sincronización temporal continua
+                # ============================================================
+                # 🕒 Timestamps continuos
+                # ============================================================
                 if start_time is None:
                     start_time = datetime.now()
                     sample_counter = 0
@@ -125,7 +148,9 @@ async def websocket_endpoint(websocket: WebSocket):
                 ]
                 sample_counter += len(filtered)
 
-                # Inserción eficiente en la base de datos
+                # ============================================================
+                # 💾 Inserción a base de datos
+                # ============================================================
                 c = get_cursor()
                 execute_batch(
                     c,
@@ -138,7 +163,11 @@ async def websocket_endpoint(websocket: WebSocket):
                 )
                 conn.commit()
 
-                print(f"✅ {len(filtered)} muestras procesadas y guardadas (t0={timestamps[0]})")
+                print(
+                    f"✅ {len(filtered)} muestras procesadas "
+                    f"(lag={lag}, t0={timestamps[0].strftime('%H:%M:%S.%f')[:-3]})"
+                )
+
                 await websocket.send_text(f"OK:{len(filtered)}")
 
             except Exception as e:
