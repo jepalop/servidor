@@ -46,14 +46,14 @@ def get_cursor():
 # ============================================================
 FS = 250  # Hz
 buffers = {1: [], 2: []}
-start_time = None
+start_time = None  # hora base de la sesión (datetime)
 sample_counter = 0
 
 # ============================================================
-# PARSE BINARIO (corregido + debug)
+# PARSE BINARIO — versión corregida
 # ============================================================
 def parse_binary_packet(packet_bytes):
-    """Decodifica paquete binario proveniente de la app Android."""
+    """Decodifica y sincroniza los datos de cada dispositivo BLE."""
     try:
         header_fmt = "<Bqhh"  # [device_id][timestamp_start][sample_rate][n_samples]
         header_size = struct.calcsize(header_fmt)
@@ -70,20 +70,22 @@ def parse_binary_packet(packet_bytes):
         data_fmt = f"<{n}f"
         samples = struct.unpack_from(data_fmt, packet_bytes, header_size)
 
-        # 🧠 Si es la primera vez, fijamos tiempo base (hora actual UTC)
+        # --- Base de sincronización relativa ---
         global start_time
         if start_time is None:
             start_time = datetime.utcnow()
-            print(f"🕒 Sesión iniciada: {start_time.isoformat()}")
+            parse_binary_packet.base_ts = ts_start
+            print(f"🕒 Nueva sesión iniciada a {start_time.isoformat()} (base_ts={ts_start})")
 
-        # Calcular timestamps relativos a la sesión
+        base_ts = getattr(parse_binary_packet, "base_ts", ts_start)
+
+        # Convertir timestamps relativos a la sesión
         timestamps = [
-            start_time + timedelta(seconds=(ts_start / 1000.0 - start_time.timestamp()) + i / fs)
+            start_time + timedelta(milliseconds=(ts_start - base_ts) + (i * 1000.0 / fs))
             for i in range(n)
         ]
 
-        print(f"📦 Paquete decodificado — Device {device_id} | {n} muestras | t0={timestamps[0].time()}")
-
+        print(f"📦 Device {device_id}: {n} muestras | Δt_rel={ts_start - base_ts} ms")
         return device_id, timestamps, samples
 
     except Exception as e:
@@ -96,10 +98,9 @@ def parse_binary_packet(packet_bytes):
 def align_and_subtract():
     """
     Alinea los buffers de Neurona_front (1) y Neurona_ref (2)
-    y calcula la señal rereferenciada.
+    y calcula la señal rereferenciada (front - ref).
     """
     global buffers
-
     if not buffers[1] or not buffers[2]:
         return None
 
@@ -107,11 +108,11 @@ def align_and_subtract():
     t2 = buffers[2][0][0]
     dt = abs((t1 - t2).total_seconds())
 
-    # Debug para ver desalineaciones
+    # Log para analizar sincronización
     if dt > 0.001:
         print(f"⚠️ Desalineación temporal detectada: Δt={dt*1000:.2f} ms")
 
-    # Espera si aún no están alineadas dentro de 20 ms
+    # Esperar hasta que estén suficientemente cerca (<20 ms)
     if dt > 0.02:
         return None
 
@@ -122,16 +123,15 @@ def align_and_subtract():
     reref = np.array(v1) - np.array(v2)
     timestamps = t1[:n]
 
-    # Vaciar los fragmentos usados
+    # Vaciar buffers procesados
     buffers[1] = buffers[1][n:]
     buffers[2] = buffers[2][n:]
 
     print(f"✅ Alineadas {n} muestras — front:{len(buffers[1])} / ref:{len(buffers[2])} restantes")
-
     return list(zip(timestamps, reref))
 
 def insert_processed_data(data):
-    """Inserta en PostgreSQL las señales rereferenciadas."""
+    """Guarda las señales rereferenciadas en la base de datos."""
     try:
         c = get_cursor()
         execute_batch(
@@ -197,6 +197,7 @@ async def websocket_endpoint(websocket: WebSocket):
 # ============================================================
 @app.get("/signals/processed")
 async def get_signals_processed(limit: int = Query(750, ge=1, le=10000)):
+    """Devuelve los últimos registros rereferenciados (para graficar en frontend)."""
     c = get_cursor()
     c.execute(
         """
