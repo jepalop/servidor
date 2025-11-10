@@ -50,9 +50,10 @@ start_time = None
 sample_counter = 0
 
 # ============================================================
-# PARSE BINARIO
+# PARSE BINARIO (corregido + debug)
 # ============================================================
 def parse_binary_packet(packet_bytes):
+    """Decodifica paquete binario proveniente de la app Android."""
     try:
         header_fmt = "<Bqhh"  # [device_id][timestamp_start][sample_rate][n_samples]
         header_size = struct.calcsize(header_fmt)
@@ -68,10 +69,21 @@ def parse_binary_packet(packet_bytes):
 
         data_fmt = f"<{n}f"
         samples = struct.unpack_from(data_fmt, packet_bytes, header_size)
+
+        # 🧠 Si es la primera vez, fijamos tiempo base (hora actual UTC)
+        global start_time
+        if start_time is None:
+            start_time = datetime.utcnow()
+            print(f"🕒 Sesión iniciada: {start_time.isoformat()}")
+
+        # Calcular timestamps relativos a la sesión
         timestamps = [
-            datetime.fromtimestamp(ts_start / 1000.0) + timedelta(seconds=i / fs)
+            start_time + timedelta(seconds=(ts_start / 1000.0 - start_time.timestamp()) + i / fs)
             for i in range(n)
         ]
+
+        print(f"📦 Paquete decodificado — Device {device_id} | {n} muestras | t0={timestamps[0].time()}")
+
         return device_id, timestamps, samples
 
     except Exception as e:
@@ -82,9 +94,25 @@ def parse_binary_packet(packet_bytes):
 # PROCESAMIENTO Y GUARDADO
 # ============================================================
 def align_and_subtract():
-    """Resta canal front - ref si ambos buffers tienen muestras."""
+    """
+    Alinea los buffers de Neurona_front (1) y Neurona_ref (2)
+    y calcula la señal rereferenciada.
+    """
     global buffers
+
     if not buffers[1] or not buffers[2]:
+        return None
+
+    t1 = buffers[1][0][0]
+    t2 = buffers[2][0][0]
+    dt = abs((t1 - t2).total_seconds())
+
+    # Debug para ver desalineaciones
+    if dt > 0.001:
+        print(f"⚠️ Desalineación temporal detectada: Δt={dt*1000:.2f} ms")
+
+    # Espera si aún no están alineadas dentro de 20 ms
+    if dt > 0.02:
         return None
 
     n = min(len(buffers[1]), len(buffers[2]))
@@ -94,12 +122,16 @@ def align_and_subtract():
     reref = np.array(v1) - np.array(v2)
     timestamps = t1[:n]
 
+    # Vaciar los fragmentos usados
     buffers[1] = buffers[1][n:]
     buffers[2] = buffers[2][n:]
+
+    print(f"✅ Alineadas {n} muestras — front:{len(buffers[1])} / ref:{len(buffers[2])} restantes")
 
     return list(zip(timestamps, reref))
 
 def insert_processed_data(data):
+    """Inserta en PostgreSQL las señales rereferenciadas."""
     try:
         c = get_cursor()
         execute_batch(
@@ -112,7 +144,7 @@ def insert_processed_data(data):
             page_size=500,
         )
         conn.commit()
-        print(f"✅ Guardadas {len(data)} muestras procesadas")
+        print(f"💾 Guardadas {len(data)} muestras procesadas")
     except Exception as e:
         conn.rollback()
         print("⚠️ Error al guardar en la BD:", e)
@@ -134,8 +166,8 @@ async def websocket_endpoint(websocket: WebSocket):
 
     try:
         while True:
-            # 🔹 Recibir tanto frames binarios como texto
             message = await websocket.receive()
+
             if "bytes" in message and message["bytes"]:
                 packet_bytes = message["bytes"]
             elif "text" in message and message["text"]:
@@ -143,7 +175,6 @@ async def websocket_endpoint(websocket: WebSocket):
             else:
                 continue
 
-            print(f"📦 Paquete recibido ({len(packet_bytes)} bytes)")
             parsed = parse_binary_packet(packet_bytes)
             if not parsed:
                 continue
