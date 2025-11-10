@@ -46,14 +46,13 @@ def get_cursor():
 # ============================================================
 FS = 250  # Hz
 buffers = {1: [], 2: []}
-start_time = None  # hora base de la sesión (datetime)
+start_time = None
 sample_counter = 0
 
 # ============================================================
-# PARSE BINARIO — versión corregida
+# PARSE BINARIO
 # ============================================================
 def parse_binary_packet(packet_bytes):
-    """Decodifica y sincroniza los datos de cada dispositivo BLE."""
     try:
         header_fmt = "<Bqhh"  # [device_id][timestamp_start][sample_rate][n_samples]
         header_size = struct.calcsize(header_fmt)
@@ -70,7 +69,6 @@ def parse_binary_packet(packet_bytes):
         data_fmt = f"<{n}f"
         samples = struct.unpack_from(data_fmt, packet_bytes, header_size)
 
-        # --- Base de sincronización relativa ---
         global start_time
         if start_time is None:
             start_time = datetime.utcnow()
@@ -79,7 +77,6 @@ def parse_binary_packet(packet_bytes):
 
         base_ts = getattr(parse_binary_packet, "base_ts", ts_start)
 
-        # Convertir timestamps relativos a la sesión
         timestamps = [
             start_time + timedelta(milliseconds=(ts_start - base_ts) + (i * 1000.0 / fs))
             for i in range(n)
@@ -96,23 +93,21 @@ def parse_binary_packet(packet_bytes):
 # PROCESAMIENTO Y GUARDADO
 # ============================================================
 def align_and_subtract():
-    """
-    Alinea los buffers de Neurona_front (1) y Neurona_ref (2)
-    y calcula la señal rereferenciada (front - ref).
-    """
     global buffers
     if not buffers[1] or not buffers[2]:
         return None
+
+    # Compensación fija de 90 ms para Neurona_ref
+    # (ajusta este valor según el delta observado en tus logs)
+    buffers[2] = [(t + timedelta(milliseconds=90), v) for t, v in buffers[2]]
 
     t1 = buffers[1][0][0]
     t2 = buffers[2][0][0]
     dt = abs((t1 - t2).total_seconds())
 
-    # Log para analizar sincronización
     if dt > 0.001:
         print(f"⚠️ Desalineación temporal detectada: Δt={dt*1000:.2f} ms")
 
-    # Esperar hasta que estén suficientemente cerca (<20 ms)
     if dt > 0.02:
         return None
 
@@ -123,7 +118,6 @@ def align_and_subtract():
     reref = np.array(v1) - np.array(v2)
     timestamps = t1[:n]
 
-    # Vaciar buffers procesados
     buffers[1] = buffers[1][n:]
     buffers[2] = buffers[2][n:]
 
@@ -131,7 +125,6 @@ def align_and_subtract():
     return list(zip(timestamps, reref))
 
 def insert_processed_data(data):
-    """Guarda las señales rereferenciadas en la base de datos."""
     try:
         c = get_cursor()
         execute_batch(
@@ -150,15 +143,12 @@ def insert_processed_data(data):
         print("⚠️ Error al guardar en la BD:", e)
 
 # ============================================================
-# ENDPOINT ROOT
+# ENDPOINTS
 # ============================================================
 @app.get("/")
 async def root():
     return {"message": "🧠 Servidor activo y listo (sincronización continua habilitada)"}
 
-# ============================================================
-# WEBSOCKET PRINCIPAL
-# ============================================================
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
@@ -167,7 +157,6 @@ async def websocket_endpoint(websocket: WebSocket):
     try:
         while True:
             message = await websocket.receive()
-
             if "bytes" in message and message["bytes"]:
                 packet_bytes = message["bytes"]
             elif "text" in message and message["text"]:
@@ -192,12 +181,8 @@ async def websocket_endpoint(websocket: WebSocket):
     finally:
         print("❌ App desconectada del WebSocket")
 
-# ============================================================
-# ENDPOINT REST PARA FRONTEND
-# ============================================================
 @app.get("/signals/processed")
 async def get_signals_processed(limit: int = Query(750, ge=1, le=10000)):
-    """Devuelve los últimos registros rereferenciados (para graficar en frontend)."""
     c = get_cursor()
     c.execute(
         """
