@@ -33,7 +33,6 @@ def connect_db():
 conn, cursor = connect_db()
 
 def get_cursor():
-    """Verifica que la conexión con PostgreSQL siga activa."""
     global conn, cursor
     try:
         cursor.execute("SELECT 1;")
@@ -45,81 +44,62 @@ def get_cursor():
 # ============================================================
 # CONFIGURACIÓN GLOBAL
 # ============================================================
-FS_DEFAULT = 250  # Hz (valor de referencia)
-buffers = {1: [], 2: []}  # 1=front, 2=ref
+FS = 250  # Hz
+buffers = {1: [], 2: []}
+start_time = None
+sample_counter = 0
 
 # ============================================================
-# ENDPOINT PRINCIPAL
-# ============================================================
-@app.get("/")
-async def root():
-    return {"message": "🧠 Servidor activo y listo (recepción binaria sincronizada habilitada)"}
-
-# ============================================================
-# PARSEO DE PAQUETE BINARIO (nuevo formato)
+# PARSE BINARIO
 # ============================================================
 def parse_binary_packet(packet_bytes):
-    """
-    Estructura esperada del paquete:
-    [device_id:1][timestamp_start:8][sample_rate:2][n_samples:2][floats:4*n]
-    """
-    header_fmt = "<Bqhh"
-    header_size = struct.calcsize(header_fmt)
-    if len(packet_bytes) < header_size:
-        print("⚠️ Paquete demasiado corto (sin cabecera)")
-        return None
+    try:
+        header_fmt = "<Bqhh"  # [device_id][timestamp_start][sample_rate][n_samples]
+        header_size = struct.calcsize(header_fmt)
+        if len(packet_bytes) < header_size:
+            print("⚠️ Paquete demasiado corto para cabecera")
+            return None
 
-    device_id, ts_start, fs, n = struct.unpack_from(header_fmt, packet_bytes, 0)
-    if n <= 0 or n > 10000:
-        print(f"⚠️ Tamaño inválido n={n}")
-        return None
+        device_id, ts_start, fs, n = struct.unpack_from(header_fmt, packet_bytes, 0)
+        expected_size = header_size + 4 * n
+        if len(packet_bytes) != expected_size:
+            print(f"⚠️ Tamaño inesperado ({len(packet_bytes)} vs {expected_size})")
+            return None
 
-    data_fmt = f"<{n}f"
-    expected_size = header_size + struct.calcsize(data_fmt)
-    if len(packet_bytes) < expected_size:
-        print("⚠️ Paquete incompleto, descartado")
-        return None
+        data_fmt = f"<{n}f"
+        samples = struct.unpack_from(data_fmt, packet_bytes, header_size)
+        timestamps = [
+            datetime.fromtimestamp(ts_start / 1000.0) + timedelta(seconds=i / fs)
+            for i in range(n)
+        ]
+        return device_id, timestamps, samples
 
-    samples = struct.unpack_from(data_fmt, packet_bytes, header_size)
-    timestamps = [datetime.fromtimestamp(ts_start / 1000.0) + timedelta(seconds=i / fs) for i in range(n)]
-    return device_id, timestamps, samples
+    except Exception as e:
+        print("⚠️ Error parseando paquete:", e)
+        return None
 
 # ============================================================
-# ALINEACIÓN Y RESTA SINCRONIZADA
+# PROCESAMIENTO Y GUARDADO
 # ============================================================
 def align_and_subtract():
-    """
-    Busca timestamps coincidentes (o muy cercanos) entre front y ref.
-    Calcula front - ref y devuelve [(timestamp, value_uv)].
-    """
+    """Resta canal front - ref si ambos buffers tienen muestras."""
+    global buffers
     if not buffers[1] or not buffers[2]:
-        return []
+        return None
 
-    front_ts, front_vals = zip(*buffers[1])
-    ref_ts, ref_vals = zip(*buffers[2])
-    ref_ts_np = np.array([ts.timestamp() for ts in ref_ts])
-    ref_vals_np = np.array(ref_vals)
+    n = min(len(buffers[1]), len(buffers[2]))
+    t1, v1 = zip(*buffers[1][:n])
+    t2, v2 = zip(*buffers[2][:n])
 
-    results = []
-    for t, v_front in zip(front_ts, front_vals):
-        t_sec = t.timestamp()
-        idx = np.argmin(np.abs(ref_ts_np - t_sec))
-        if abs(ref_ts_np[idx] - t_sec) <= 0.004:  # tolerancia de 4 ms
-            diff = v_front - ref_vals_np[idx]
-            results.append((t, diff))
+    reref = np.array(v1) - np.array(v2)
+    timestamps = t1[:n]
 
-    # Mantener últimas 100 muestras en buffers (por posibles retrasos)
-    buffers[1] = buffers[1][-100:]
-    buffers[2] = buffers[2][-100:]
+    buffers[1] = buffers[1][n:]
+    buffers[2] = buffers[2][n:]
 
-    return results
+    return list(zip(timestamps, reref))
 
-# ============================================================
-# GUARDADO EN BASE DE DATOS
-# ============================================================
-def insert_processed_data(rows):
-    if not rows:
-        return
+def insert_processed_data(data):
     try:
         c = get_cursor()
         execute_batch(
@@ -128,17 +108,24 @@ def insert_processed_data(rows):
             INSERT INTO brain_signals_processed (device_id, timestamp, value_uv)
             VALUES (%s, %s, %s)
             """,
-            [("reref", ts, float(val)) for ts, val in rows],
+            [("reref", ts, float(v)) for ts, v in data],
             page_size=500,
         )
         conn.commit()
-        print(f"💾 Guardadas {len(rows)} muestras procesadas")
+        print(f"✅ Guardadas {len(data)} muestras procesadas")
     except Exception as e:
         conn.rollback()
         print("⚠️ Error al guardar en la BD:", e)
 
 # ============================================================
-# WEBSOCKET HANDLER
+# ENDPOINT ROOT
+# ============================================================
+@app.get("/")
+async def root():
+    return {"message": "🧠 Servidor activo y listo (sincronización continua habilitada)"}
+
+# ============================================================
+# WEBSOCKET PRINCIPAL
 # ============================================================
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -147,7 +134,16 @@ async def websocket_endpoint(websocket: WebSocket):
 
     try:
         while True:
-            packet_bytes = await websocket.receive_bytes()
+            # 🔹 Recibir tanto frames binarios como texto
+            message = await websocket.receive()
+            if "bytes" in message and message["bytes"]:
+                packet_bytes = message["bytes"]
+            elif "text" in message and message["text"]:
+                packet_bytes = message["text"].encode("latin-1")
+            else:
+                continue
+
+            print(f"📦 Paquete recibido ({len(packet_bytes)} bytes)")
             parsed = parse_binary_packet(packet_bytes)
             if not parsed:
                 continue
@@ -159,17 +155,17 @@ async def websocket_endpoint(websocket: WebSocket):
             if results:
                 insert_processed_data(results)
                 await websocket.send_text(f"OK:{len(results)}")
+
     except Exception as e:
         print("⚠️ Error en WebSocket:", e)
     finally:
         print("❌ App desconectada del WebSocket")
 
 # ============================================================
-# CONSULTA REST PARA EL FRONTEND
+# ENDPOINT REST PARA FRONTEND
 # ============================================================
 @app.get("/signals/processed")
 async def get_signals_processed(limit: int = Query(750, ge=1, le=10000)):
-    """Devuelve las últimas muestras procesadas para el frontend."""
     c = get_cursor()
     c.execute(
         """
