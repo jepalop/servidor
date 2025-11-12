@@ -45,17 +45,16 @@ def get_cursor():
 # CONFIGURACIÓN GLOBAL
 # ============================================================
 FS = 250  # Hz
-buffers = {1: [], 2: []}     # cada clave guarda arrays numpy con valores
-timestamps_blocks = {1: None, 2: None}  # timestamp inicial del bloque
+buffers = {1: None, 2: None}
 start_time = None
 
 # ============================================================
-# PARSE BINARIO — versión por bloque
+# PARSE BINARIO — formato por bloque
 # ============================================================
 def parse_binary_packet(packet_bytes):
     """
-    Decodifica y devuelve los datos de un paquete BLE.
-    Devuelve (device_id, ts_start, samples)
+    Devuelve (device_id, samples) desde un paquete BLE.
+    Ignora los timestamps, se sincroniza por índice.
     """
     try:
         header_fmt = "<Bqhh"  # [device_id][timestamp_start][sample_rate][n_samples]
@@ -71,58 +70,42 @@ def parse_binary_packet(packet_bytes):
             return None
 
         data_fmt = f"<{n}f"
-        samples = np.array(struct.unpack_from(data_fmt, packet_bytes, header_size), dtype=np.float32)
-
-        global start_time
-        if start_time is None:
-            start_time = datetime.utcnow()
-            parse_binary_packet.base_ts = ts_start
-            print(f"🕒 Nueva sesión iniciada a {start_time.isoformat()} (base_ts={ts_start})")
-
-        return device_id, ts_start, samples
+        samples = np.frombuffer(packet_bytes, dtype=np.float32, offset=header_size, count=n)
+        return device_id, samples
 
     except Exception as e:
         print("⚠️ Error parseando paquete:", e)
         return None
 
 # ============================================================
-# PROCESAMIENTO POR BLOQUES (sincronía por índice)
+# PROCESAMIENTO POR MUESTRA
 # ============================================================
 def process_by_sample_index():
     """
-    Procesa los bloques de ambos sensores por número de muestra.
-    Si ambos tienen un bloque disponible (misma longitud),
-    calcula la resta muestra a muestra (front - ref).
+    Combina los buffers de ambos sensores por índice (0..N-1).
+    Genera una señal rereferenciada front - ref.
     """
-    global buffers, timestamps_blocks, start_time
+    global buffers, start_time
 
-    if len(buffers[1]) == 0 or len(buffers[2]) == 0:
+    s1 = buffers[1]
+    s2 = buffers[2]
+    if s1 is None or s2 is None:
         return None
 
-    # Tomamos el bloque más antiguo de cada uno
-    s1 = np.concatenate(buffers[1])
-    s2 = np.concatenate(buffers[2])
-
-    # Igualar tamaños (por seguridad, aunque ambos deberían tener 2500)
     n = min(len(s1), len(s2))
     if n == 0:
         return None
 
-    s1 = s1[:n]
-    s2 = s2[:n]
-    reref = s1 - s2
+    reref = s1[:n] - s2[:n]
 
-    # Generar timestamps a partir del bloque más antiguo
-    base_ts1 = timestamps_blocks[1]
-    base_ts2 = timestamps_blocks[2]
-    base_ts = min(base_ts1, base_ts2)
+    # Generar timestamps relativos solo para referencia visual
+    if start_time is None:
+        start_time = datetime.utcnow()
+    timestamps = [start_time + timedelta(milliseconds=i * 1000.0 / FS) for i in range(n)]
 
-    base_time = start_time + timedelta(milliseconds=(base_ts - getattr(parse_binary_packet, "base_ts", base_ts)))
-    timestamps = [base_time + timedelta(milliseconds=i * 1000.0 / FS) for i in range(n)]
-
-    print(f"✅ Bloque procesado: {n} muestras sincronizadas (por índice)")
-    buffers = {1: [], 2: []}
-    timestamps_blocks = {1: None, 2: None}
+    # Reiniciar buffers
+    buffers = {1: None, 2: None}
+    print(f"✅ Bloque procesado por índice: {n} muestras rereferenciadas")
 
     return list(zip(timestamps, reref))
 
@@ -139,7 +122,7 @@ def insert_processed_data(data):
             INSERT INTO brain_signals_processed (device_id, timestamp, value_uv)
             VALUES (%s, %s, %s)
             """,
-            [("reref", ts, float(v)) for ts, v in data],
+            [(0, ts, float(v)) for ts, v in data],  # device_id=0 → reref
             page_size=500,
         )
         conn.commit()
@@ -167,25 +150,19 @@ async def websocket_endpoint(websocket: WebSocket):
         while True:
             message = await websocket.receive()
 
-            if "bytes" in message and message["bytes"]:
-                packet_bytes = message["bytes"]
-            elif "text" in message and message["text"]:
-                packet_bytes = message["text"].encode("latin-1")
-            else:
+            packet_bytes = message.get("bytes") or message.get("text", "").encode("latin-1")
+            if not packet_bytes:
                 continue
 
             parsed = parse_binary_packet(packet_bytes)
             if not parsed:
                 continue
 
-            device_id, ts_start, samples = parsed
+            device_id, samples = parsed
+            buffers[device_id] = samples
 
-            # Guardar bloque completo y su timestamp inicial
-            buffers[device_id].append(samples)
-            timestamps_blocks[device_id] = ts_start
-
-            # Procesar solo cuando ambos sensores hayan enviado un bloque
-            if buffers[1] and buffers[2]:
+            # Procesar cuando ambos sensores hayan enviado su bloque
+            if buffers[1] is not None and buffers[2] is not None:
                 results = process_by_sample_index()
                 if results:
                     insert_processed_data(results)
