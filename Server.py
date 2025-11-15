@@ -49,28 +49,30 @@ buffers = {1: None, 2: None}
 start_time = None
 
 # ============================================================
-# PARSE BINARIO — formato por bloque
+# PARSE BINARIO
 # ============================================================
 def parse_binary_packet(packet_bytes):
     """
     Devuelve (device_id, samples) desde un paquete BLE.
-    Ignora los timestamps, se sincroniza por índice.
     """
     try:
         header_fmt = "<Bqhh"  # [device_id][timestamp_start][sample_rate][n_samples]
         header_size = struct.calcsize(header_fmt)
+
         if len(packet_bytes) < header_size:
             print("⚠️ Paquete demasiado corto para cabecera")
             return None
 
         device_id, ts_start, fs, n = struct.unpack_from(header_fmt, packet_bytes, 0)
         expected_size = header_size + 4 * n
+
         if len(packet_bytes) != expected_size:
             print(f"⚠️ Tamaño inesperado ({len(packet_bytes)} vs {expected_size})")
             return None
 
-        data_fmt = f"<{n}f"
-        samples = np.frombuffer(packet_bytes, dtype=np.float32, offset=header_size, count=n)
+        samples = np.frombuffer(packet_bytes, dtype=np.float32,
+                                offset=header_size, count=n)
+
         return device_id, samples
 
     except Exception as e:
@@ -78,12 +80,46 @@ def parse_binary_packet(packet_bytes):
         return None
 
 # ============================================================
-# PROCESAMIENTO POR MUESTRA
+# GUARDADO DE RAW
+# ============================================================
+def insert_raw_data(device_id, samples):
+    """
+    Guarda los valores RAW de cada sensor (para análisis offline).
+    """
+    try:
+        c = get_cursor()
+
+        now = datetime.utcnow()
+        rows = [
+            (now + timedelta(milliseconds=i * 1000 / FS),
+             device_id,
+             float(samples[i]))
+            for i in range(len(samples))
+        ]
+
+        execute_batch(
+            c,
+            """
+            INSERT INTO brain_signals_raw (timestamp, device_id, value_uv)
+            VALUES (%s, %s, %s)
+            """,
+            rows,
+            page_size=500,
+        )
+
+        conn.commit()
+        print(f"💾 RAW guardados: {len(samples)} muestras (dev {device_id})")
+
+    except Exception as e:
+        conn.rollback()
+        print("⚠️ Error guardando RAW:", e)
+
+# ============================================================
+# PROCESAR Y REREFERENCIAR
 # ============================================================
 def process_by_sample_index():
     """
-    Combina los buffers de ambos sensores por índice (0..N-1).
-    Genera una señal rereferenciada front - ref.
+    Restado índice por índice: front - ref.
     """
     global buffers, start_time
 
@@ -98,48 +134,54 @@ def process_by_sample_index():
 
     reref = s1[:n] - s2[:n]
 
-    # Generar timestamps relativos solo para referencia visual
+    # timestamps
     if start_time is None:
         start_time = datetime.utcnow()
-    timestamps = [start_time + timedelta(milliseconds=i * 1000.0 / FS) for i in range(n)]
 
-    # Reiniciar buffers
+    timestamps = [
+        start_time + timedelta(milliseconds=i * 1000 / FS)
+        for i in range(n)
+    ]
+
     buffers = {1: None, 2: None}
-    print(f"✅ Bloque procesado por índice: {n} muestras rereferenciadas")
+
+    print(f"✅ Bloque procesado: {n} muestras rereferenciadas")
 
     return list(zip(timestamps, reref))
 
 # ============================================================
-# GUARDADO EN BASE DE DATOS
+# GUARDADO DE REREFERENCIADA
 # ============================================================
 def insert_processed_data(data):
-    """Guarda las señales rereferenciadas en la base de datos."""
     try:
         c = get_cursor()
+
         execute_batch(
             c,
             """
             INSERT INTO brain_signals_processed (device_id, timestamp, value_uv)
             VALUES (%s, %s, %s)
             """,
-            [(0, ts, float(v)) for ts, v in data],  # device_id=0 → reref
+            [(0, ts, float(v)) for ts, v in data],
             page_size=500,
         )
+
         conn.commit()
-        print(f"💾 Guardadas {len(data)} muestras procesadas")
+        print(f"💾 Guardadas {len(data)} muestras rereferenciadas")
+
     except Exception as e:
         conn.rollback()
-        print("⚠️ Error al guardar en la BD:", e)
+        print("⚠️ Error guardando rereferenciada:", e)
 
 # ============================================================
 # ENDPOINT ROOT
 # ============================================================
 @app.get("/")
 async def root():
-    return {"message": "🧠 Servidor activo — sincronía por número de muestra"}
+    return {"message": "🧠 Servidor activo — sincronía por índice y RAW habilitado"}
 
 # ============================================================
-# WEBSOCKET PRINCIPAL
+# WEBSOCKET
 # ============================================================
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -148,37 +190,41 @@ async def websocket_endpoint(websocket: WebSocket):
 
     try:
         while True:
-            message = await websocket.receive()
-
-            packet_bytes = message.get("bytes") or message.get("text", "").encode("latin-1")
-            if not packet_bytes:
+            msg = await websocket.receive()
+            packet = msg.get("bytes") or msg.get("text", "").encode("latin-1")
+            if not packet:
                 continue
 
-            parsed = parse_binary_packet(packet_bytes)
+            parsed = parse_binary_packet(packet)
             if not parsed:
                 continue
 
             device_id, samples = parsed
+
+            # Guardamos RAW SIEMPRE
+            insert_raw_data(device_id, samples)
+
             buffers[device_id] = samples
 
-            # Procesar cuando ambos sensores hayan enviado su bloque
+            # Procesar cuando hay bloque en ambos sensores
             if buffers[1] is not None and buffers[2] is not None:
                 results = process_by_sample_index()
+
                 if results:
                     insert_processed_data(results)
                     await websocket.send_text(f"OK:{len(results)}")
 
     except Exception as e:
         print("⚠️ Error en WebSocket:", e)
+
     finally:
         print("❌ App desconectada del WebSocket")
 
 # ============================================================
-# ENDPOINT REST PARA FRONTEND
+# ENDPOINT PARA FRONTEND
 # ============================================================
 @app.get("/signals/processed")
 async def get_signals_processed(limit: int = Query(750, ge=1, le=10000)):
-    """Devuelve los últimos registros rereferenciados (para graficar en frontend)."""
     c = get_cursor()
     c.execute(
         """
@@ -190,6 +236,7 @@ async def get_signals_processed(limit: int = Query(750, ge=1, le=10000)):
         (limit,),
     )
     rows = c.fetchall()
+
     return [
         {
             "id": r[0],
@@ -199,4 +246,3 @@ async def get_signals_processed(limit: int = Query(750, ge=1, le=10000)):
         }
         for r in rows
     ]
-
