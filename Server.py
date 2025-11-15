@@ -7,9 +7,6 @@ from fastapi import FastAPI, WebSocket, Query
 from fastapi.middleware.cors import CORSMiddleware
 from psycopg2.extras import execute_batch
 
-# 🔽 NUEVO: importamos scipy.signal igual que en tu script de serie
-from scipy.signal import butter, filtfilt, iirnotch
-
 # ============================================================
 # FASTAPI SETUP
 # ============================================================
@@ -28,15 +25,12 @@ app.add_middleware(
 # ============================================================
 DB_URL = os.getenv("DATABASE_URL")
 
-
 def connect_db():
     conn = psycopg2.connect(DB_URL)
     conn.autocommit = False
     return conn, conn.cursor()
 
-
 conn, cursor = connect_db()
-
 
 def get_cursor():
     global conn, cursor
@@ -47,33 +41,12 @@ def get_cursor():
         conn, cursor = connect_db()
     return cursor
 
-
 # ============================================================
 # CONFIGURACIÓN GLOBAL
 # ============================================================
 FS = 250  # Hz
 buffers = {1: None, 2: None}
 start_time = None
-
-# ----------------- PARÁMETROS DE FILTRO (como en el script) -----
-HPF_HZ, LPF_HZ = 0.5, 70.0
-NOTCH_FREQ, Q = 50.0, 30.0
-ORDER = 2
-
-
-def butter_bandpass(sig, fs, low=HPF_HZ, high=LPF_HZ, order=ORDER):
-    """Band-pass Butterworth: low–high Hz, aplicado con filtfilt."""
-    nyq = 0.5 * fs
-    b, a = butter(order, [low / nyq, high / nyq], btype="band")
-    return filtfilt(b, a, sig)
-
-
-def notch_filter(sig, fs, freq=NOTCH_FREQ, Q=Q):
-    """Notch IIR en 'freq' Hz (50 Hz) con calidad Q, aplicado con filtfilt."""
-    w0 = freq / (fs / 2.0)  # frecuencia normalizada
-    b, a = iirnotch(w0, Q)
-    return filtfilt(b, a, sig)
-
 
 # ============================================================
 # PARSE BINARIO — formato por bloque
@@ -97,15 +70,12 @@ def parse_binary_packet(packet_bytes):
             return None
 
         data_fmt = f"<{n}f"
-        samples = np.frombuffer(
-            packet_bytes, dtype=np.float32, offset=header_size, count=n
-        )
+        samples = np.frombuffer(packet_bytes, dtype=np.float32, offset=header_size, count=n)
         return device_id, samples
 
     except Exception as e:
         print("⚠️ Error parseando paquete:", e)
         return None
-
 
 # ============================================================
 # PROCESAMIENTO POR MUESTRA
@@ -113,9 +83,7 @@ def parse_binary_packet(packet_bytes):
 def process_by_sample_index():
     """
     Combina los buffers de ambos sensores por índice (0..N-1).
-    Genera una señal rereferenciada front - ref y aplica:
-       - bandpass 0.5–70 Hz (Butterworth 2º orden, filtfilt)
-       - notch 50 Hz (Q=30, filtfilt)
+    Genera una señal rereferenciada front - ref.
     """
     global buffers, start_time
 
@@ -128,36 +96,18 @@ def process_by_sample_index():
     if n == 0:
         return None
 
-    # 1) rereferencia: front - ref
     reref = s1[:n] - s2[:n]
-    reref = reref.astype(np.float64)
 
-    # 2) quitar media (como en el script)
-    reref -= np.mean(reref)
-
-    # 3) bandpass 0.5–70 Hz y luego notch 50 Hz
-    try:
-        bp = butter_bandpass(reref, FS)
-        filtered = notch_filter(bp, FS)
-    except Exception as e:
-        print("⚠️ Error aplicando filtros:", e)
-        filtered = reref  # fallback sin filtrar, por si acaso
-
-    # 4) timestamps relativos solo para referencia visual
+    # Generar timestamps relativos solo para referencia visual
     if start_time is None:
         start_time = datetime.utcnow()
+    timestamps = [start_time + timedelta(milliseconds=i * 1000.0 / FS) for i in range(n)]
 
-    dt_ms = 1000.0 / FS
-    timestamps = [
-        start_time + timedelta(milliseconds=i * dt_ms) for i in range(n)
-    ]
-
-    # Reiniciar buffers (siguiente bloque independiente)
+    # Reiniciar buffers
     buffers = {1: None, 2: None}
-    print(f"✅ Bloque procesado por índice: {n} muestras rereferenciadas y filtradas")
+    print(f"✅ Bloque procesado por índice: {n} muestras rereferenciadas")
 
-    return list(zip(timestamps, filtered))
-
+    return list(zip(timestamps, reref))
 
 # ============================================================
 # GUARDADO EN BASE DE DATOS
@@ -181,16 +131,12 @@ def insert_processed_data(data):
         conn.rollback()
         print("⚠️ Error al guardar en la BD:", e)
 
-
 # ============================================================
 # ENDPOINT ROOT
 # ============================================================
 @app.get("/")
 async def root():
-    return {
-        "message": "🧠 Servidor activo — sincronía por número de muestra + bandpass 0.5–70 Hz + notch 50 Hz"
-    }
-
+    return {"message": "🧠 Servidor activo — sincronía por número de muestra"}
 
 # ============================================================
 # WEBSOCKET PRINCIPAL
@@ -204,9 +150,7 @@ async def websocket_endpoint(websocket: WebSocket):
         while True:
             message = await websocket.receive()
 
-            packet_bytes = message.get("bytes") or message.get("text", "").encode(
-                "latin-1"
-            )
+            packet_bytes = message.get("bytes") or message.get("text", "").encode("latin-1")
             if not packet_bytes:
                 continue
 
@@ -228,7 +172,6 @@ async def websocket_endpoint(websocket: WebSocket):
         print("⚠️ Error en WebSocket:", e)
     finally:
         print("❌ App desconectada del WebSocket")
-
 
 # ============================================================
 # ENDPOINT REST PARA FRONTEND
