@@ -7,6 +7,9 @@ from fastapi import FastAPI, WebSocket, Query
 from fastapi.middleware.cors import CORSMiddleware
 from psycopg2.extras import execute_batch
 
+# 🔽 NUEVO: importamos scipy.signal igual que en tu script de serie
+from scipy.signal import butter, filtfilt, iirnotch
+
 # ============================================================
 # FASTAPI SETUP
 # ============================================================
@@ -48,75 +51,28 @@ def get_cursor():
 # ============================================================
 # CONFIGURACIÓN GLOBAL
 # ============================================================
-FS = 250  # Hz (frecuencia de muestreo)
-
+FS = 250  # Hz
 buffers = {1: None, 2: None}
 start_time = None
 
-# ============================================================
-# FILTROS: 1 Hz HPF, 50 Hz Notch, 70 Hz LPF
-# Coeficientes calculados para FS = 250 Hz (Butterworth 2º orden)
-# ============================================================
-# Paso alto 1 Hz (Butterworth 2º orden)
-B_HP = np.array([0.98238544, -1.96477088, 0.98238544], dtype=np.float64)
-A_HP = np.array([1.0, -1.96446058, 0.96508117], dtype=np.float64)
-
-# Notch 50 Hz (Q ≈ 30)
-B_NOTCH = np.array([0.97948276, -0.60535364, 0.97948276], dtype=np.float64)
-A_NOTCH = np.array([1.0, -0.60535364, 0.95896552], dtype=np.float64)
-
-# Paso bajo 70 Hz (Butterworth 2º orden)
-B_LP = np.array([0.35034638, 0.70069276, 0.35034638], dtype=np.float64)
-A_LP = np.array([1.0, 0.22115344, 0.18023207], dtype=np.float64)
-
-print("🎛️ Filtros activos: HPF 1 Hz, Notch 50 Hz, LPF 70 Hz @ 250 Hz")
+# ----------------- PARÁMETROS DE FILTRO (como en el script) -----
+HPF_HZ, LPF_HZ = 0.5, 70.0
+NOTCH_FREQ, Q = 50.0, 30.0
+ORDER = 2
 
 
-def iir_filter_2nd_order(b, a, x):
-    """
-    Filtro IIR de 2º orden (biquad) aplicado por bloque.
-    Ecuación en diferencias:
-    y[n] = b0*x[n] + b1*x[n-1] + b2*x[n-2] - a1*y[n-1] - a2*y[n-2]
-    """
-    x = np.asarray(x, dtype=np.float64)
-    y = np.zeros_like(x, dtype=np.float64)
-
-    b0, b1, b2 = b
-    _, a1, a2 = a
-
-    for n in range(len(x)):
-        xn = x[n]
-        y_n = b0 * xn
-        if n >= 1:
-            y_n += b1 * x[n - 1] - a1 * y[n - 1]
-        if n >= 2:
-            y_n += b2 * x[n - 2] - a2 * y[n - 2]
-        y[n] = y_n
-
-    return y
+def butter_bandpass(sig, fs, low=HPF_HZ, high=LPF_HZ, order=ORDER):
+    """Band-pass Butterworth: low–high Hz, aplicado con filtfilt."""
+    nyq = 0.5 * fs
+    b, a = butter(order, [low / nyq, high / nyq], btype="band")
+    return filtfilt(b, a, sig)
 
 
-def apply_filters(signal_block):
-    """
-    Aplica en cascada:
-      1) Paso alto 1 Hz
-      2) Notch 50 Hz
-      3) Paso bajo 70 Hz
-    """
-    if signal_block is None or len(signal_block) == 0:
-        return signal_block
-
-    # Convertir a float64 para evitar acumulación de error
-    x = np.asarray(signal_block, dtype=np.float64)
-
-    # 1) HPF 1 Hz
-    y = iir_filter_2nd_order(B_HP, A_HP, x)
-    # 2) Notch 50 Hz
-    y = iir_filter_2nd_order(B_NOTCH, A_NOTCH, y)
-    # 3) LPF 70 Hz
-    y = iir_filter_2nd_order(B_LP, A_LP, y)
-
-    return y.astype(np.float32)
+def notch_filter(sig, fs, freq=NOTCH_FREQ, Q=Q):
+    """Notch IIR en 'freq' Hz (50 Hz) con calidad Q, aplicado con filtfilt."""
+    w0 = freq / (fs / 2.0)  # frecuencia normalizada
+    b, a = iirnotch(w0, Q)
+    return filtfilt(b, a, sig)
 
 
 # ============================================================
@@ -140,7 +96,7 @@ def parse_binary_packet(packet_bytes):
             print(f"⚠️ Tamaño inesperado ({len(packet_bytes)} vs {expected_size})")
             return None
 
-        # Leemos directamente como float32
+        data_fmt = f"<{n}f"
         samples = np.frombuffer(
             packet_bytes, dtype=np.float32, offset=header_size, count=n
         )
@@ -157,10 +113,9 @@ def parse_binary_packet(packet_bytes):
 def process_by_sample_index():
     """
     Combina los buffers de ambos sensores por índice (0..N-1).
-    Genera una señal rereferenciada front - ref y le aplica filtros:
-       - HPF 1 Hz
-       - Notch 50 Hz
-       - LPF 70 Hz
+    Genera una señal rereferenciada front - ref y aplica:
+       - bandpass 0.5–70 Hz (Butterworth 2º orden, filtfilt)
+       - notch 50 Hz (Q=30, filtfilt)
     """
     global buffers, start_time
 
@@ -173,13 +128,22 @@ def process_by_sample_index():
     if n == 0:
         return None
 
-    # 1) Rereferenciar (front - ref)
+    # 1) rereferencia: front - ref
     reref = s1[:n] - s2[:n]
+    reref = reref.astype(np.float64)
 
-    # 2) Aplicar filtros en cascada
-    filtered = apply_filters(reref)
+    # 2) quitar media (como en el script)
+    reref -= np.mean(reref)
 
-    # 3) Generar timestamps relativos (sobre todo para visualización)
+    # 3) bandpass 0.5–70 Hz y luego notch 50 Hz
+    try:
+        bp = butter_bandpass(reref, FS)
+        filtered = notch_filter(bp, FS)
+    except Exception as e:
+        print("⚠️ Error aplicando filtros:", e)
+        filtered = reref  # fallback sin filtrar, por si acaso
+
+    # 4) timestamps relativos solo para referencia visual
     if start_time is None:
         start_time = datetime.utcnow()
 
@@ -187,10 +151,8 @@ def process_by_sample_index():
     timestamps = [
         start_time + timedelta(milliseconds=i * dt_ms) for i in range(n)
     ]
-    # Avanzamos start_time para el siguiente bloque
-    start_time = timestamps[-1] + timedelta(milliseconds=dt_ms)
 
-    # Reiniciar buffers
+    # Reiniciar buffers (siguiente bloque independiente)
     buffers = {1: None, 2: None}
     print(f"✅ Bloque procesado por índice: {n} muestras rereferenciadas y filtradas")
 
@@ -225,7 +187,9 @@ def insert_processed_data(data):
 # ============================================================
 @app.get("/")
 async def root():
-    return {"message": "🧠 Servidor activo — sincronía por número de muestra + filtros 1–70 Hz & notch 50 Hz"}
+    return {
+        "message": "🧠 Servidor activo — sincronía por número de muestra + bandpass 0.5–70 Hz + notch 50 Hz"
+    }
 
 
 # ============================================================
@@ -292,3 +256,4 @@ async def get_signals_processed(limit: int = Query(750, ge=1, le=10000)):
         }
         for r in rows
     ]
+
